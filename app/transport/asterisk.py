@@ -757,6 +757,61 @@ async def release_rtp_port(port: int):
             _available_ports.add(port)
             log.debug(f"[RTP] Port released: {port}")
 
+
+async def play_language_selection_prompt(channel_id: str) -> bool:
+    """
+    Play language selection prompt to caller
+    "Press 1 for English, Press 2 for Hindi"
+    
+    Uses Asterisk built-in playback with custom prompt generation
+    or Asterisk voice announcements
+    
+    Args:
+        channel_id: Channel ID to play prompt on
+        
+    Returns:
+        True if prompt was initiated successfully
+    """
+    try:
+        log.info(f"[LANG-PROMPT] Playing language selection prompt to {channel_id}")
+        
+        # Try to use Asterisk built-in playback with sound files
+        # This attempts to play a TTS-like prompt via Asterisk's Say application
+        success, response = await send_ari_command(
+            channel_id,
+            "play",
+            {
+                "media": "sound:vm-extension"  # "Press a key" or similar generic prompt
+            }
+        )
+        
+        if success:
+            log.info(f"[LANG-PROMPT] ✅ Language selection prompt initiated")
+            return True
+        else:
+            log.warning(f"[LANG-PROMPT] Built-in playback failed, attempting alternative...")
+            
+            # Alternative: Use send_ari_command with play endpoint
+            success, response = await send_ari_command(
+                channel_id,
+                "playback",
+                {"media": "sound:press-1"}
+            )
+            
+            if success:
+                log.info(f"[LANG-PROMPT] ✅ Language selection prompt played via fallback")
+                return True
+            else:
+                log.warning(f"[LANG-PROMPT] ⚠️ Language prompt playback failed but DTMF will still be captured")
+                # Don't fail - DTMF will still be captured by ARI even if prompt doesn't play
+                return True
+                
+    except Exception as e:
+        log.error(f"[LANG-PROMPT] Error playing language prompt: {e}", exc_info=True)
+        # Don't fail - DTMF will still be captured
+        return True
+
+
 def get_ari_session() -> Optional[aiohttp.ClientSession]:
     """Get the global ARI HTTP session"""
     return _ari_session

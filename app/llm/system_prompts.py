@@ -12,12 +12,29 @@ class SystemPromptBuilder:
     """Builder for dynamic system prompts"""
 
     @staticmethod
-    def build_greeting_prompt() -> str:
-        """Build system prompt for greeting phase"""
+    def build_greeting_prompt(language: str = "en") -> str:
+        """
+        Build system prompt for greeting phase
+        
+        Args:
+            language: "en" for English, "hi" for Hindi
+        """
+        greeting_text = ClientConfig.GREETING
+        
+        # Hindi greeting (translated)
+        if language == "hi":
+            greeting_text = (
+                "नमस्ते! सुप्रभात। हमारी कॉल लेने के लिए धन्यवाद। हम इंडस्ट्रियल केबल टाई, "
+                "केबल क्लिप और डिस्पोजेबल वुडन प्रोडक्ट्स जैसे वुडन फोर्क, कटोरी और कटलरी में डील करते हैं। "
+                "हम आपके बिजनेस की जरूरतें और आपकी रुचि वाले प्रोडक्ट्स को समझना चाहते हैं। "
+                "क्या मैं आपसे कुछ जानकारी ले सकता हूँ?"
+            )
+        
         return f"""
 You are a professional Indian B2B sales representative for {ClientConfig.BUSINESS_NAME}.
 
 Your role is to greet customers warmly and professionally on inbound calls.
+Language: {"Hindi" if language == "hi" else "English"}
 
 Personality:
 - Friendly and approachable
@@ -28,7 +45,7 @@ Personality:
 - Concise in communication
 
 You will start with this greeting:
-"{ClientConfig.GREETING}"
+"{greeting_text}"
 
 After greeting, wait for the customer's response before proceeding.
 """
@@ -37,9 +54,17 @@ After greeting, wait for the customer's response before proceeding.
     def build_collection_prompt(
         completed_fields: List[str],
         pending_fields: List[str],
-        current_data: Dict[str, Any]
+        current_data: Dict[str, Any],
+        language: str = "en"
     ) -> str:
-        """Build system prompt for requirement collection phase"""
+        """Build system prompt for requirement collection phase
+        
+        Args:
+            completed_fields: Fields that have been collected
+            pending_fields: Fields still pending
+            current_data: Current customer data
+            language: "en" for English, "hi" for Hindi
+        """
         
         completed_summary = ""
         if completed_fields:
@@ -55,13 +80,17 @@ After greeting, wait for the customer's response before proceeding.
         next_field = pending_fields[0] if pending_fields else None
         next_question = ClientConfig.get_question(next_field) if next_field else ""
         
+        language_instruction = ""
+        if language == "hi":
+            language_instruction = "\n\n🇮🇳 LANGUAGE: Answer in Hindi. Use natural Hindi conversation style."
+        
         return f"""
 You are a professional B2B sales representative collecting customer business requirements.
+Language: {"Hindi" if language == "hi" else "English"}
 
 Business Context:
 - Company: {ClientConfig.BUSINESS_NAME}
 - Products: {', '.join(ClientConfig.PRODUCTS)}
-- Language: {ClientConfig.DEFAULT_LANGUAGE}
 
 Your Role:
 1. Ask ONE question at a time (never multiple)
@@ -98,18 +127,30 @@ If customer provides quantity without unit, ask:
 If customer provides multiple details in one response:
 Extract ALL information and skip already-answered questions.
 
-CRITICAL: Always sound like a real person, not a robot. Use natural pauses and human-like responses.
+CRITICAL: Always sound like a real person, not a robot. Use natural pauses and human-like responses.{language_instruction}
 """
 
     @staticmethod
     def build_validation_prompt(
         completed_fields: List[str],
-        unclear_fields: List[str]
+        unclear_fields: List[str],
+        language: str = "en"
     ) -> str:
-        """Build system prompt for validation phase"""
+        """Build system prompt for validation phase
+        
+        Args:
+            completed_fields: Fields that have been collected
+            unclear_fields: Fields that need clarification
+            language: "en" for English, "hi" for Hindi
+        """
+        
+        language_instruction = ""
+        if language == "hi":
+            language_instruction = "\n\n🇮🇳 LANGUAGE: Respond in Hindi. Use natural Hindi conversation style."
         
         return f"""
 You are validating customer business requirements before saving.
+Language: {"Hindi" if language == "hi" else "English"}
 
 Completed Fields ({len(completed_fields)}/7):
 {', '.join(completed_fields) if completed_fields else 'None'}
@@ -131,58 +172,93 @@ Remaining Required Fields:
 6. Business Requirement - How they plan to use the products (wholesale, retail, manufacturing, etc.)
 7. Bulk & Other Requirements - Bulk purchase status and any other specific needs
 
-Do not proceed to closing until all 7 fields have valid information.
+Do not proceed to closing until all 7 fields have valid information.{language_instruction}
 """
 
     @staticmethod
-    def build_closing_prompt() -> str:
-        """Build system prompt for closing phase"""
+    def build_closing_prompt(language: str = "en") -> str:
+        """Build system prompt for closing phase
+        
+        Args:
+            language: "en" for English, "hi" for Hindi
+        """
+        
+        closing_text = ClientConfig.CLOSING_MESSAGE
+        
+        # Hindi closing (translated)
+        if language == "hi":
+            closing_text = (
+                "अपनी जरूरतें साझा करने के लिए धन्यवाद। हमने आपकी प्रोडक्ट और क्वांटिटी की जरूरतों को नोट कर लिया है। "
+                "हमारी सेल्स टीम इन विवरणों की समीक्षा करेगी और आगे की चर्चा के लिए जल्दी ही आपसे संपर्क करेगी। "
+                "आपने हमें अपना कीमती समय दिया, इसके लिए धन्यवाद। आपका दिन शुभ हो!"
+            )
+        
+        language_instruction = ""
+        if language == "hi":
+            language_instruction = "\n\n🇮🇳 LANGUAGE: Respond in Hindi. Use natural, warm Hindi conversation style."
         
         return f"""
 You are completing the customer call conversation.
+Language: {"Hindi" if language == "hi" else "English"}
 
 All customer information has been successfully collected and saved.
 
 Your task:
 1. Play the closing message:
-"{ClientConfig.CLOSING_MESSAGE}"
+"{closing_text}"
 
 2. Wait for the customer to acknowledge or respond.
 
 3. After closing message is played, the call will end automatically.
 
 Do not ask any more questions after the closing message.
-Be warm, appreciative, and professional in your closing.
+Be warm, appreciative, and professional in your closing.{language_instruction}
 """
 
     @staticmethod
-    def build_error_recovery_prompt(error_message: str) -> str:
-        """Build system prompt for error recovery"""
+    def build_error_recovery_prompt(error_message: str, language: str = "en") -> str:
+        """Build system prompt for error recovery
+        
+        Args:
+            error_message: Description of the error
+            language: "en" for English, "hi" for Hindi
+        """
+        
+        language_instruction = ""
+        if language == "hi":
+            language_instruction = "\n\n🇮🇳 LANGUAGE: Respond in Hindi. Use natural, apologetic Hindi."
         
         return f"""
 An error occurred during the conversation: {error_message}
+Language: {"Hindi" if language == "hi" else "English"}
 
 Your task:
 1. Acknowledge the issue politely
 2. Reassure the customer
 3. Continue with the next appropriate step
 
-Example responses:
+Example responses (English):
 - "I apologize for the brief interruption. Let me continue."
 - "Thank you for your patience. Where were we?"
 - "I had a small technical difficulty. Could you please repeat that?"
+
+Example responses (Hindi):
+- "क्षमा करें, एक छोटी सी बाधा आई। आइए जारी रखते हैं।"
+- "आपके धैर्य के लिए धन्यवाद। हम कहाँ थे?"
+- "मुझे एक तकनीकी समस्या आई। क्या आप फिर से बता सकते हैं?"
 
 After error recovery:
 - Determine which information was successfully collected
 - Identify what still needs to be collected
 - Continue with the next pending field
 
-Always maintain a professional, helpful tone.
+Always maintain a professional, helpful tone.{language_instruction}
 """
 
 
 def build_full_system_prompt(
     phase: str,
+    language: str = "en",
     completed_fields: Optional[List[str]] = None,
     pending_fields: Optional[List[str]] = None,
     unclear_fields: Optional[List[str]] = None,
@@ -193,6 +269,7 @@ def build_full_system_prompt(
     
     Args:
         phase: One of 'greeting', 'collection', 'validation', 'closing', 'error'
+        language: "en" for English, "hi" for Hindi
         completed_fields: List of fields that have been answered
         pending_fields: List of fields still needed
         unclear_fields: List of fields that need clarification
@@ -203,30 +280,30 @@ def build_full_system_prompt(
     """
     try:
         if phase == "greeting":
-            return SystemPromptBuilder.build_greeting_prompt()
+            return SystemPromptBuilder.build_greeting_prompt(language=language)
         
         elif phase == "collection":
             completed = completed_fields or []
             pending = pending_fields or []
             data = current_data or {}
-            return SystemPromptBuilder.build_collection_prompt(completed, pending, data)
+            return SystemPromptBuilder.build_collection_prompt(completed, pending, data, language=language)
         
         elif phase == "validation":
             completed = completed_fields or []
             unclear = unclear_fields or []
-            return SystemPromptBuilder.build_validation_prompt(completed, unclear)
+            return SystemPromptBuilder.build_validation_prompt(completed, unclear, language=language)
         
         elif phase == "closing":
-            return SystemPromptBuilder.build_closing_prompt()
+            return SystemPromptBuilder.build_closing_prompt(language=language)
         
         elif phase == "error":
             error = current_data.get("error_message", "Unknown error") if current_data else "Unknown error"
-            return SystemPromptBuilder.build_error_recovery_prompt(error)
+            return SystemPromptBuilder.build_error_recovery_prompt(error, language=language)
         
         else:
             log.warning(f"[Prompts] Unknown phase: {phase}")
-            return SystemPromptBuilder.build_collection_prompt([], [], {})
+            return SystemPromptBuilder.build_collection_prompt([], [], {}, language=language)
     
     except Exception as e:
         log.error(f"[Prompts] Error building prompt: {e}")
-        return SystemPromptBuilder.build_collection_prompt([], [], {})
+        return SystemPromptBuilder.build_collection_prompt([], [], {}, language=language)
