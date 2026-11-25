@@ -56,6 +56,30 @@ class CallHandler:
                 return False
 
             log.info(f"[CallHandler] ✅ Session initialized for {call_id}")
+            
+            # 🔧 CRITICAL: Create media (RTP) session for audio streaming
+            try:
+                from ..services.media_service import get_media_service, MediaConfig
+                
+                media_service = get_media_service()
+                if media_service:
+                    media_config = MediaConfig(
+                        call_id=call_id,
+                        rtp_ip="0.0.0.0",
+                        rtp_port=0  # Let service allocate
+                    )
+                    
+                    media_session = await media_service.create_session(media_config)
+                    if media_session:
+                        log.info(f"[CallHandler] ✅ Media session created for {call_id}")
+                    else:
+                        log.warning(f"[CallHandler] Failed to create media session, audio may not work")
+                else:
+                    log.warning("[CallHandler] Media service not available, audio may not work")
+                    
+            except Exception as e:
+                log.warning(f"[CallHandler] Error creating media session: {e}")
+            
             return True
 
         except Exception as e:
