@@ -1,93 +1,110 @@
 """
 Gemini Live Audio Pipeline
-End-to-end speech-to-speech audio processing without STT/TTS intermediaries
-Handles real-time audio streaming from caller to Gemini and response back to caller
+Streams caller audio into Gemini Live and sends Gemini's reply back to the caller's RTP leg.
+
+Audio flow:
+  RTP RX (8 kHz PCMU, decoded to PCM16)
+    -> add_audio_input()            (queue, must be 16 kHz PCM16 - see note in add_audio_input)
+    -> audio_input_generator()      (real-time, never gated on AI speaking state)
+    -> GeminiLiveProvider           (Gemini Live session for the whole call)
+    -> reply audio 24 kHz PCM16
+    -> OutboundResampler            (inside the provider: 24 kHz -> 8 kHz mu-law)
+    -> enqueue_ulaw_to_rtp()        (splits into 160-byte frames)
+    -> media_session.tx_queue       (existing TX loop sends them to the caller)
 """
 
 import asyncio
-from typing import Optional, Dict, Any, Callable, AsyncIterator
+from typing import Optional, Dict, Callable, AsyncIterator
 from datetime import datetime
 
 from ..core.config import log
 from ..llm.gemini_live_provider import get_gemini_live_provider
 
+RTP_FRAME_SIZE = 160  # 20 ms of G.711 mu-law at 8 kHz
+
 
 class GeminiAudioSession:
-    """Manages a Gemini Live audio session for a specific call"""
+    """Manages one Gemini Live conversation for one call."""
 
     def __init__(self, call_id: str, language: str = "en"):
         self.call_id = call_id
         self.language = language
         self.gemini_provider = get_gemini_live_provider()
         self.session_active = False
-        self.audio_buffer = asyncio.Queue(maxsize=1000)  # Buffer incoming RTP audio
-        self.response_queue = asyncio.Queue(maxsize=1000)  # Buffer response audio
+        self.audio_buffer = asyncio.Queue(maxsize=1000)   # caller audio waiting for Gemini
         self.created_at = datetime.utcnow()
-        self.session_lock = asyncio.Lock()
-        
+        self.media_session = None                          # set with attach_media()
+        self._tx_remainder = bytearray()                   # partial 160-byte RTP frame
+
         log.info(f"[Gemini Audio] Session created: {call_id}")
 
+    # ------------------------------------------------------------------ #
+    # Setup
+    # ------------------------------------------------------------------ #
+    def attach_media(self, media_session) -> None:
+        """Give this session the media session whose tx_queue carries audio to the caller."""
+        self.media_session = media_session
+        log.info(f"[Gemini Audio] Media session attached for call {self.call_id}")
+
     async def initialize_session(self, system_prompt: Optional[str] = None) -> bool:
-        """Initialize Gemini Live session for this call"""
+        """Create the per-call Gemini session record."""
         try:
             if not self.gemini_provider:
-                log.error(f"[Gemini Audio] Gemini provider not available")
+                log.error("[Gemini Audio] Gemini provider not available")
                 return False
 
-            # Create Gemini session
             success = await self.gemini_provider.create_live_session(system_prompt)
-            if success:
-                self.session_active = True
-                log.info(f"[Gemini Audio] ✅ Gemini session initialized for call {self.call_id}")
-                
-                # ========== LIFECYCLE LOG: Gemini Connected & Session Ready ==========
-                try:
-                    from ..services.call_lifecycle_logger import get_call_lifecycle_logger
-                    lifecycle_logger = get_call_lifecycle_logger()
-                    if lifecycle_logger:
-                        lifecycle_logger.log_gemini_connected(self.call_id)
-                        if self.gemini_provider.session_id:
-                            lifecycle_logger.log_session_ready(self.call_id, self.gemini_provider.session_id)
-                except Exception as e:
-                    log.debug(f"[Gemini Audio] Error logging session ready: {e}")
-                
-                return True
-            else:
-                log.error(f"[Gemini Audio] Failed to initialize Gemini session")
+            if not success:
+                log.error("[Gemini Audio] Failed to initialize Gemini session")
                 return False
+
+            self.session_active = True
+            log.info(f"[Gemini Audio] ✅ Gemini session initialized for call {self.call_id}")
+
+            try:
+                from ..services.call_lifecycle_logger import get_call_lifecycle_logger
+                lifecycle_logger = get_call_lifecycle_logger()
+                if lifecycle_logger:
+                    lifecycle_logger.log_gemini_connected(self.call_id)
+                    if self.gemini_provider.session_id:
+                        lifecycle_logger.log_session_ready(self.call_id, self.gemini_provider.session_id)
+            except Exception as e:
+                log.debug(f"[Gemini Audio] Error logging session ready: {e}")
+
+            return True
 
         except Exception as e:
             log.error(f"[Gemini Audio] Session initialization error: {e}")
             return False
 
+    # ------------------------------------------------------------------ #
+    # Caller audio in
+    # ------------------------------------------------------------------ #
     async def add_audio_input(self, audio_chunk: bytes) -> bool:
         """
-        Queue incoming audio chunk from caller for Gemini processing
-        
-        Args:
-            audio_chunk: 160-byte PCM audio frame @ 8kHz
-            
-        Returns:
-            bool: True if queued successfully
+        Queue one caller audio frame for Gemini.
+
+        Note: the provider expects 16 kHz 16-bit mono PCM. If the RX path gives 8 kHz
+        PCM, upsample it before calling this method (one 20 ms frame = 640 bytes at 16 kHz).
+        Frames must arrive at real-time pace, including silence.
         """
         try:
             if not self.session_active:
                 log.warning(f"[Gemini Audio] Session not active for call {self.call_id}")
                 return False
-
-            if not audio_chunk or len(audio_chunk) == 0:
+            if not audio_chunk:
                 return True
 
             try:
                 self.audio_buffer.put_nowait(audio_chunk)
                 return True
             except asyncio.QueueFull:
+                # Drop the oldest frame so the newest speech is kept
                 log.warning(f"[Gemini Audio] Audio buffer full for call {self.call_id}")
-                # Remove oldest to make space
                 try:
                     self.audio_buffer.get_nowait()
                     self.audio_buffer.put_nowait(audio_chunk)
-                except asyncio.QueueEmpty:
+                except (asyncio.QueueEmpty, asyncio.QueueFull):
                     pass
                 return False
 
@@ -95,135 +112,115 @@ class GeminiAudioSession:
             log.error(f"[Gemini Audio] Error adding audio input: {e}")
             return False
 
-    async def get_response_audio(self) -> Optional[bytes]:
-        """
-        Get next response audio chunk from queue
-        
-        Returns:
-            Audio chunk or None if queue empty
-        """
-        try:
-            return self.response_queue.get_nowait()
-        except asyncio.QueueEmpty:
-            return None
-
     async def audio_input_generator(self) -> AsyncIterator[bytes]:
         """
-        Async generator for audio input stream
-        Yields audio chunks from the input buffer
+        Yield caller audio to the provider for as long as the call lasts.
+        Nothing here depends on whether the AI is currently speaking.
+        Ends after 5 minutes with no caller audio at all, or when the session ends.
         """
-        try:
-            timeout_count = 0
-            max_timeout = 300  # 5 minutes of continuous silence
-            
-            while self.session_active:
-                try:
-                    # Wait for audio with timeout
-                    audio_chunk = await asyncio.wait_for(
-                        self.audio_buffer.get(),
-                        timeout=1.0
-                    )
-                    timeout_count = 0
-                    yield audio_chunk
-                    
-                except asyncio.TimeoutError:
-                    timeout_count += 1
-                    if timeout_count >= max_timeout:
-                        log.warning(f"[Gemini Audio] No audio for 5 minutes, ending stream")
-                        break
-                    # Continue waiting
-                    continue
+        silent_seconds = 0
+        max_silent_seconds = 300
 
-                except asyncio.CancelledError:
-                    log.info(f"[Gemini Audio] Audio generator cancelled")
+        while self.session_active:
+            try:
+                chunk = await asyncio.wait_for(self.audio_buffer.get(), timeout=1.0)
+                silent_seconds = 0
+                yield chunk
+            except asyncio.TimeoutError:
+                silent_seconds += 1
+                if silent_seconds >= max_silent_seconds:
+                    log.warning(f"[Gemini Audio] No caller audio for {max_silent_seconds}s, ending stream")
                     break
+            except asyncio.CancelledError:
+                log.info(f"[Gemini Audio] Audio generator cancelled for call {self.call_id}")
+                raise
 
-        except Exception as e:
-            log.error(f"[Gemini Audio] Error in audio generator: {e}")
+    # ------------------------------------------------------------------ #
+    # Reply audio out
+    # ------------------------------------------------------------------ #
+    def enqueue_ulaw_to_rtp(self, ulaw: bytes) -> None:
+        """
+        Called by the provider with 8 kHz mu-law bytes of Gemini's reply.
+        Splits them into 160-byte frames and queues them for the RTP TX loop.
+        """
+        if not ulaw:
+            return
+        if self.media_session is None:
+            log.error(f"[Gemini Audio] No media session attached for call {self.call_id}; reply dropped")
+            return
 
+        self._tx_remainder.extend(ulaw)
+        tx_queue = self.media_session.tx_queue
+
+        while len(self._tx_remainder) >= RTP_FRAME_SIZE:
+            frame = bytes(self._tx_remainder[:RTP_FRAME_SIZE])
+            del self._tx_remainder[:RTP_FRAME_SIZE]
+            try:
+                tx_queue.put_nowait(frame)
+            except asyncio.QueueFull:
+                log.warning(f"[Gemini Audio] TX queue full, dropping reply frame for call {self.call_id}")
+                return
+
+    # ------------------------------------------------------------------ #
+    # Conversation
+    # ------------------------------------------------------------------ #
     async def process_audio_stream(
         self,
-        on_response_audio: Optional[Callable[[bytes], None]] = None,
         on_response_text: Optional[Callable[[str], None]] = None,
-        greeting_text: Optional[str] = None
+        greeting_text: Optional[str] = None,
     ) -> bool:
         """
-        Start processing audio through Gemini Live with Groq fallback
-        
-        ✅ FIX: Automatic failover to Groq if Gemini fails
-        
-        Args:
-            on_response_audio: Callback for each response audio chunk
-            on_response_text: Callback for response text transcriptions
-            greeting_text: Optional greeting to send as first message
-            
-        Returns:
-            bool: Success status
+        Run the Gemini Live conversation for the whole call.
+        Reply audio goes straight to RTP via enqueue_ulaw_to_rtp().
+        Returns True if the conversation ran, False if Gemini could not be used.
         """
         try:
             if not self.session_active or not self.gemini_provider:
-                log.error(f"[Gemini Audio] Session not ready")
+                log.error("[Gemini Audio] Session not ready")
                 return False
 
-            log.info(f"[Gemini Audio] Starting audio stream processing for call {self.call_id}")
+            if self.media_session is None:
+                log.error(f"[Gemini Audio] Media session not attached for call {self.call_id}")
+                return False
+
+            log.info(f"[Gemini Audio] Starting conversation for call {self.call_id}")
             if greeting_text:
                 log.info(f"[Gemini Audio]    ├─ Greeting: '{greeting_text[:60]}...'")
-                log.info(f"[Gemini Audio]    └─ Will be sent as first message to Gemini Live")
 
-            # Create audio input generator
             audio_gen = self.audio_input_generator()
 
-            # Callback to queue response audio
-            def queue_response_audio(audio_bytes: bytes):
-                try:
-                    self.response_queue.put_nowait(audio_bytes)
-                except asyncio.QueueFull:
-                    log.warning(f"[Gemini Audio] Response queue full, dropping frame")
-
-            # Try Gemini Live with failover to Groq
             try:
                 from ..services.llm_failover_service import get_llm_failover_service
                 failover_service = get_llm_failover_service()
-                
+
                 if failover_service:
-                    # Try Gemini first
-                    log.info(f"[Gemini Audio] 🎯 Attempting primary: Gemini Live")
+                    log.info("[Gemini Audio] 🎯 Attempting primary: Gemini Live")
                     response_audio = await failover_service.try_gemini_live(
                         self.call_id,
                         audio_input_stream=audio_gen,
-                        on_audio_chunk=queue_response_audio,
+                        on_ulaw_chunk=self.enqueue_ulaw_to_rtp,
                         on_text_chunk=on_response_text,
-                        greeting_text=greeting_text
+                        greeting_text=greeting_text,
                     )
-                    
-                    if response_audio:
-                        log.info(f"[Gemini Audio] ✅ Gemini Live succeeded")
-                        return True
-                    
-                    # Fallback to Groq if Gemini failed
-                    log.warning(f"[Gemini Audio] ⚠️  Gemini Live unavailable - activating Groq fallback")
-                    # Note: Groq handles text LLM, not audio streaming
-                    # For this integration, we'd need TTS synthesis for audio fallback
-                    # For now, we just log the failure
-                    
                 else:
-                    # No failover service, try Gemini directly
-                    log.info(f"[Gemini Audio] No failover service, trying Gemini Live directly")
+                    log.info("[Gemini Audio] No failover service, using Gemini Live directly")
                     response_audio = await self.gemini_provider.stream_audio_bidirectional(
                         audio_input_stream=audio_gen,
-                        on_audio_chunk=queue_response_audio,
+                        on_ulaw_chunk=self.enqueue_ulaw_to_rtp,
                         on_text_chunk=on_response_text,
-                        greeting_text=greeting_text
+                        greeting_text=greeting_text,
                     )
-                    
-                    if response_audio:
-                        log.info(f"[Gemini Audio] ✅ Stream processing completed")
-                        return True
-                
-            except Exception as e:
-                log.error(f"[Gemini Audio] Error during failover attempt: {e}", exc_info=True)
 
-            log.warning(f"[Gemini Audio] ⚠️  Could not process audio stream (Gemini and fallback both unavailable)")
+                if response_audio:
+                    log.info("[Gemini Audio] ✅ Gemini Live conversation finished with reply audio")
+                else:
+                    log.warning("[Gemini Audio] ⚠️  Gemini Live ended with no reply audio")
+                return True
+
+            except Exception as e:
+                log.error(f"[Gemini Audio] Error during Gemini conversation: {e}", exc_info=True)
+
+            log.warning("[Gemini Audio] ⚠️  Could not process audio stream (Gemini unavailable)")
             return False
 
         except Exception as e:
@@ -231,14 +228,14 @@ class GeminiAudioSession:
             return False
 
     async def end_session(self) -> bool:
-        """End the Gemini audio session"""
+        """End the session and flush any partial reply frame."""
         try:
             self.session_active = False
-            
-            # Close Gemini session
+            self._tx_remainder.clear()
+
             if self.gemini_provider:
                 await self.gemini_provider.close_session()
-            
+
             log.info(f"[Gemini Audio] Session ended for call {self.call_id}")
             return True
 
@@ -247,41 +244,40 @@ class GeminiAudioSession:
             return False
 
 
-# Global session manager
+# ---------------------------------------------------------------------- #
+# Session registry (one entry per call)
+# ---------------------------------------------------------------------- #
 _audio_sessions: Dict[str, GeminiAudioSession] = {}
 _sessions_lock = asyncio.Lock()
 
 
-async def create_gemini_audio_session(call_id: str, language: str = "en", system_prompt: Optional[str] = None) -> Optional[GeminiAudioSession]:
+async def create_gemini_audio_session(
+    call_id: str,
+    language: str = "en",
+    system_prompt: Optional[str] = None,
+    media_session=None,
+) -> Optional[GeminiAudioSession]:
     """
-    Create a new Gemini audio session for a call
-    
-    Args:
-        call_id: Unique call identifier
-        language: Language code (en, hi, etc.)
-        system_prompt: Custom system instructions
-        
-    Returns:
-        GeminiAudioSession instance or None
+    Create the Gemini audio session for a call.
+    Pass media_session so reply audio can reach the caller's TX queue.
     """
     try:
         async with _sessions_lock:
-            # Check if session already exists
             if call_id in _audio_sessions:
                 log.warning(f"[Gemini Audio] Session already exists for call {call_id}")
                 return _audio_sessions[call_id]
 
-            # Create new session
             session = GeminiAudioSession(call_id, language)
-            success = await session.initialize_session(system_prompt)
-            
-            if success:
+            if media_session is not None:
+                session.attach_media(media_session)
+
+            if await session.initialize_session(system_prompt):
                 _audio_sessions[call_id] = session
                 log.info(f"[Gemini Audio] ✅ Audio session created: {call_id}")
                 return session
-            else:
-                log.error(f"[Gemini Audio] Failed to create audio session")
-                return None
+
+            log.error("[Gemini Audio] Failed to create audio session")
+            return None
 
     except Exception as e:
         log.error(f"[Gemini Audio] Error creating session: {e}")
@@ -289,13 +285,11 @@ async def create_gemini_audio_session(call_id: str, language: str = "en", system
 
 
 async def get_gemini_audio_session(call_id: str) -> Optional[GeminiAudioSession]:
-    """Get existing Gemini audio session"""
     async with _sessions_lock:
         return _audio_sessions.get(call_id)
 
 
 async def end_gemini_audio_session(call_id: str) -> bool:
-    """End a Gemini audio session"""
     try:
         async with _sessions_lock:
             session = _audio_sessions.pop(call_id, None)
@@ -303,32 +297,26 @@ async def end_gemini_audio_session(call_id: str) -> bool:
                 await session.end_session()
                 log.info(f"[Gemini Audio] Session ended: {call_id}")
                 return True
-            else:
-                log.warning(f"[Gemini Audio] No session found for call {call_id}")
-                return False
-
+            log.warning(f"[Gemini Audio] No session found for call {call_id}")
+            return False
     except Exception as e:
         log.error(f"[Gemini Audio] Error ending session: {e}")
         return False
 
 
 async def cleanup_all_sessions() -> bool:
-    """Cleanup all active Gemini audio sessions"""
     try:
         async with _sessions_lock:
             count = len(_audio_sessions)
             for call_id in list(_audio_sessions.keys()):
                 session = _audio_sessions.pop(call_id)
                 await session.end_session()
-            
             log.info(f"[Gemini Audio] Cleaned up {count} sessions")
             return True
-
     except Exception as e:
         log.error(f"[Gemini Audio] Error cleaning up sessions: {e}")
         return False
 
 
 def get_gemini_provider():
-    """Get the Gemini Live provider instance"""
     return get_gemini_live_provider()

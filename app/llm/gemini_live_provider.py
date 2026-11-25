@@ -2,13 +2,12 @@
 Gemini Live Provider - continuous speech-to-speech conversation (google-genai SDK)
 
 Audio contract:
-  Input  : 16 kHz, 16-bit mono PCM bytes. Send continuously at real-time pace.
-  Output : Gemini replies with 24 kHz, 16-bit mono PCM.
-           Each reply chunk is converted to 8 kHz G.711 mu-law and passed to
-           on_ulaw_chunk, ready for RTP.
+  Input  : 16 kHz, 16-bit mono PCM. Send continuously at real-time pace.
+  Output : 24 kHz, 16-bit mono PCM from Gemini, converted to 8 kHz G.711 mu-law
+           and passed to on_ulaw_chunk.
 
-Turn-taking is handled by Gemini's voice activity detection. The session stays
-open for the whole call and ends when audio_input_stream ends.
+Barge-in is disabled (ActivityHandling.NO_INTERRUPTION): the caller's speech during
+a reply is recorded, and Gemini answers it after the current reply finishes.
 """
 
 import os
@@ -49,11 +48,6 @@ class OutboundResampler:
             return b""
         return self._convert(self._take())
 
-    def reset(self) -> None:
-        """Drop buffered audio, used on barge-in."""
-        self._buf.clear()
-        self._state = None
-
     def _take(self) -> bytes:
         chunk = bytes(self._buf)
         self._buf.clear()
@@ -68,6 +62,20 @@ class OutboundResampler:
             pcm24k, 2, 1, self.SRC_RATE, self.DST_RATE, self._state
         )
         return audioop.lin2ulaw(pcm8k, 2)
+
+
+def _build_realtime_input_config(types):
+    """Turn off barge-in so the caller's speech cannot cut off a reply."""
+    try:
+        return types.RealtimeInputConfig(
+            activity_handling=types.ActivityHandling.NO_INTERRUPTION,
+        )
+    except AttributeError:
+        log.warning(
+            "[Gemini Live] ActivityHandling.NO_INTERRUPTION not available in this SDK; "
+            "barge-in stays enabled"
+        )
+        return None
 
 
 class GeminiLiveProvider:
@@ -126,7 +134,6 @@ class GeminiLiveProvider:
                 "model": self.model,
                 "voice": self.voice,
                 "status": "active",
-                # Default is the full question script from live_prompt.py
                 "system_prompt": system_prompt or build_live_system_instruction(),
                 "audio_config": self.audio_config,
             }
@@ -152,10 +159,10 @@ class GeminiLiveProvider:
         Run one live conversation for the whole call.
 
         audio_input_stream: yields 16 kHz 16-bit mono PCM until the caller hangs up.
-        on_ulaw_chunk:      8 kHz mu-law bytes ready for RTP (use this for the call).
-        on_audio_chunk:     raw 24 kHz PCM from Gemini (optional, for logging/recording).
+        on_ulaw_chunk:      8 kHz mu-law bytes ready for RTP (the call's audio output).
+        on_audio_chunk:     raw 24 kHz PCM from Gemini (optional, for logging only).
         on_text_chunk:      text transcript of Gemini's reply.
-        on_interrupted:     called when the caller barges in. Clear the TX queue here.
+        on_interrupted:     only fires if barge-in is enabled (not with NO_INTERRUPTION).
         greeting_text:      greeting Gemini speaks once, before the caller answers.
 
         Returns all reply audio as 24 kHz PCM, or None.
@@ -168,7 +175,7 @@ class GeminiLiveProvider:
 
         model_name = self.model if self.model.startswith("models/") else f"models/{self.model}"
 
-        config = types.LiveConnectConfig(
+        config_kwargs = dict(
             response_modalities=["AUDIO"],
             system_instruction=self.session.get("system_prompt") or build_live_system_instruction(),
             generation_config=types.GenerationConfig(
@@ -181,6 +188,10 @@ class GeminiLiveProvider:
                 )
             ),
         )
+        realtime_cfg = _build_realtime_input_config(types)
+        if realtime_cfg is not None:
+            config_kwargs["realtime_input_config"] = realtime_cfg
+        config = types.LiveConnectConfig(**config_kwargs)
 
         stats = {"sent": 0, "reply_chunks": 0, "turns": 0, "interrupts": 0}
         response_audio = bytearray()
@@ -195,7 +206,6 @@ class GeminiLiveProvider:
                 log.info(f"[Gemini Live] WebSocket connected: {self.session_id}")
 
                 if greeting_text:
-                    # Sent as an instruction, so the model speaks it instead of replying to it
                     await live.send_client_content(
                         turns=types.Content(
                             role="user",
@@ -221,7 +231,6 @@ class GeminiLiveProvider:
                         log.info(f"[Gemini Live] Caller audio stream ended after {stats['sent']} frames")
 
                 async def receive_audio():
-                    # Runs for the whole call, one turn at a time
                     while True:
                         got_message = False
                         async for message in live.receive():
@@ -233,7 +242,7 @@ class GeminiLiveProvider:
                             if getattr(sc, "interrupted", False):
                                 stats["interrupts"] += 1
                                 resampler.reset()
-                                log.info("[Gemini Live] Caller barged in: clearing reply audio")
+                                log.info("[Gemini Live] Caller barged in")
                                 if on_interrupted:
                                     on_interrupted()
 
@@ -260,7 +269,6 @@ class GeminiLiveProvider:
                 send_task = asyncio.create_task(send_audio())
                 recv_task = asyncio.create_task(receive_audio())
                 try:
-                    # The call lasts as long as the caller's audio
                     await send_task
                 finally:
                     recv_task.cancel()
