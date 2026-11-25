@@ -44,7 +44,7 @@ class GeminiLiveProvider:
         }
         self.stream_lock = asyncio.Lock()
         
-        # Session ready event for greeting synchronization
+        # Session ready event for greeting synchronization (reset for each call)
         self.session_ready_event = asyncio.Event()
 
     async def initialize(self) -> bool:
@@ -99,6 +99,9 @@ class GeminiLiveProvider:
                 if not init_success:
                     log.error("[Gemini Live] Client initialization failed")
                     return False
+
+            # Reset session_ready_event for new call
+            self.session_ready_event.clear()
 
             # Generate session ID
             self.session_id = f"session_{int(datetime.utcnow().timestamp() * 1000)}"
@@ -396,24 +399,108 @@ class GeminiLiveProvider:
         self,
         prompt: str,
         system_prompt: Optional[str] = None,
-        on_chunk: Optional[Callable[[str], None]] = None
+        on_chunk: Optional[Callable[[str], None]] = None,
+        on_audio_chunk: Optional[Callable[[bytes], None]] = None
     ) -> Optional[str]:
         """
-        Stream response text using google-genai
+        Stream response using google-genai
+        
+        Can return either text or audio depending on configuration
         
         Args:
             prompt: User prompt
             system_prompt: System prompt
-            on_chunk: Callback for each chunk
+            on_chunk: Callback for each text chunk
+            on_audio_chunk: Callback for each audio chunk (for live streaming)
         
         Returns:
-            Complete response
+            Complete response (text or audio bytes)
         """
         try:
+            from google import genai
+            
             if not self.client:
                 log.error("[Gemini Live] Client not initialized")
                 return None
 
+            # If session is active and audio callback requested, use live API for audio response
+            if self.session and on_audio_chunk:
+                log.info(f"[Gemini Live] 🎵 Sending greeting text to Gemini Live for audio synthesis...")
+                
+                try:
+                    # Use Live API for audio response
+                    model_name = self.model
+                    if not model_name.startswith("models/"):
+                        model_name = f"models/{model_name}"
+                    
+                    async with self.client.aio.live.connect(
+                        model=model_name,
+                        config=genai.types.LiveConnectConfig(
+                            generation_config=genai.types.GenerationConfig(
+                                temperature=self.temperature,
+                                max_output_tokens=self.max_tokens,
+                            ),
+                            response_modalities=["AUDIO"],
+                            system_instruction=system_prompt or self.session.get('system_prompt', 
+                                "You are a helpful sales assistant. Respond concisely and naturally."),
+                        ),
+                    ) as session:
+                        log.info(f"[Gemini Live] 🔌 Connected to Live API for greeting audio synthesis")
+                        
+                        # Send prompt
+                        await session.send(
+                            genai.types.LiveClientMessage(
+                                realtime_input=genai.types.LiveClientRealtimeInput(
+                                    media_chunks=[]  # No audio input for greeting
+                                )
+                            )
+                        )
+                        
+                        # Send text prompt
+                        await session.send(
+                            genai.types.LiveClientMessage(
+                                client_content=genai.types.ClientContent(
+                                    turns=[
+                                        genai.types.Content(
+                                            role="user",
+                                            parts=[
+                                                genai.types.Part(text=prompt)
+                                            ]
+                                        )
+                                    ],
+                                    turn_complete=True
+                                )
+                            )
+                        )
+                        
+                        log.info(f"[Gemini Live] 📤 Greeting prompt sent, waiting for audio response...")
+                        
+                        response_audio = bytearray()
+                        frame_count = 0
+                        
+                        # Receive audio response
+                        async for response in session.receive():
+                            if response.server_content and response.server_content.model_turn:
+                                for part in response.server_content.model_turn.parts:
+                                    if part.inline_data and part.inline_data.data:
+                                        audio_data = part.inline_data.data
+                                        frame_count += 1
+                                        response_audio.extend(audio_data)
+                                        
+                                        log.debug(f"[Gemini Live] 📥 Greeting audio chunk {frame_count}: {len(audio_data)} bytes")
+                                        
+                                        # Callback with audio chunk
+                                        if on_audio_chunk:
+                                            on_audio_chunk(audio_data)
+                        
+                        log.info(f"[Gemini Live] ✅ Greeting audio complete: {frame_count} frames, {len(response_audio)} bytes total")
+                        return bytes(response_audio) if response_audio else None
+                        
+                except Exception as e:
+                    log.error(f"[Gemini Live] Error in greeting audio synthesis: {e}", exc_info=True)
+                    return None
+            
+            # Otherwise use standard text model
             try:
                 model = self.client.models.GenerativeModel(
                     model_id="gemini-1.5-flash",
@@ -439,8 +526,11 @@ class GeminiLiveProvider:
                 log.error(f"[Gemini Live] Streaming error: {e}")
                 return None
 
+        except ImportError:
+            log.error("[Gemini Live] google-genai not installed")
+            return None
         except Exception as e:
-            log.error(f"[Gemini Live] Error: {e}")
+            log.error(f"[Gemini Live] Error: {e}", exc_info=True)
             return None
 
     async def close_session(self) -> bool:

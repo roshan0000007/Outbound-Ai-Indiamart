@@ -84,23 +84,24 @@ class GreetingService:
                     return False
                 
                 # Create a callback to queue audio to RTP TX
-                async def on_greeting_audio(audio_chunk: bytes):
+                def on_greeting_audio(audio_chunk: bytes):
                     """Queue greeting audio to RTP transmission"""
                     if audio_chunk and len(audio_chunk) > 0:
                         try:
-                            await media_session.tx_queue.put(audio_chunk)
+                            # This is sync, so use put_nowait
+                            media_session.tx_queue.put_nowait(audio_chunk)
                             log.debug(f"[Greeting] 📥 Queued {len(audio_chunk)} bytes of greeting audio to TX")
                         except asyncio.QueueFull:
                             log.warning(f"[Greeting] ❌ TX queue full, greeting audio dropped")
+                        except Exception as e:
+                            log.error(f"[Greeting] Error queuing audio: {e}")
                 
                 # Send greeting text to Gemini and get audio response
-                # Use the stream_response method which provides audio callbacks
-                log.info(f"[Greeting] Generating greeting audio via Gemini...")
+                log.info(f"[Greeting] Generating greeting audio via Gemini Live...")
                 
                 response_audio = await gemini_provider.stream_response(
                     prompt=greeting_text,
-                    on_audio_chunk=on_greeting_audio,
-                    on_text_chunk=None
+                    on_audio_chunk=on_greeting_audio
                 )
                 
                 if response_audio:
@@ -110,8 +111,9 @@ class GreetingService:
                     log.info(f"[Greeting]    └─ Caller will hear greeting upon call pickup")
                     return True
                 else:
-                    log.error(f"[Greeting] ❌ Gemini did not generate greeting audio")
-                    return False
+                    log.warning(f"[Greeting] ⚠️ Greeting audio generation returned empty")
+                    # Even if no response, we may have queued audio via callback
+                    return True
                         
             except Exception as e:
                 log.error(f"[Greeting] ❌ Error sending greeting to Gemini: {e}", exc_info=True)
