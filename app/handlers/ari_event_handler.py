@@ -63,6 +63,15 @@ async def handle_stasis_start(event: Dict[str, Any]) -> bool:
     """
     Handle StasisStart event - new call incoming
     
+    CRITICAL ORCHESTRATION SEQUENCE:
+    1. Initialize call session and media (creates RTP socket, binds to MY_PC_IP:port)
+    2. Create mixing bridge
+    3. Add original caller channel to bridge
+    4. Create ExternalMedia channel with the allocated RTP port
+    5. Add ExternalMedia channel to bridge
+    6. Now Asterisk knows where to send RTP (to the allocated port)
+    7. Start RTP receive loop
+    
     Args:
         event: ARI StasisStart event
         
@@ -86,7 +95,7 @@ async def handle_stasis_start(event: Dict[str, Any]) -> bool:
 
         log.info(f"[ARI] ✅ Call started: {call_id} from {caller_number} to {dnid}")
 
-        # Initialize call session
+        # ========== STEP 1: Initialize call session and media ==========
         call_handler = get_call_handler()
         success = await call_handler.on_call_start(
             call_id=call_id,
@@ -95,36 +104,106 @@ async def handle_stasis_start(event: Dict[str, Any]) -> bool:
             caller_number=caller_number
         )
 
-        if success:
-            # Initialize customer requirement collection
-            try:
-                from ..services.customer_requirement_service import get_customer_requirement_service
-                req_service = get_customer_requirement_service()
-                if req_service:
-                    await req_service.initialize_call(call_id)
-                    log.info(f"[ARI] Requirement collection initialized: {call_id}")
-            except Exception as e:
-                log.warning(f"[ARI] Failed to initialize requirements: {e}")
-            
-            # Trigger greeting
-            try:
-                from ..services.greeting_service import get_greeting_service
-                greeting_service = get_greeting_service()
-                if greeting_service:
-                    await greeting_service.play_greeting(call_id)
-                    log.info(f"[ARI] ✅ Greeting triggered: {call_id}")
-            except Exception as e:
-                log.warning(f"[ARI] Failed to trigger greeting: {e}")
-            
-            # Start listening for audio
-            live_handler = get_live_call_handler()
-            if live_handler:
-                await live_handler.start_listening(call_id)
+        if not success:
+            log.error(f"[ARI] Call initialization failed for {call_id}")
+            return False
 
-        return success
+        # Get the media session to access the allocated RTP port
+        media_service = get_media_service()
+        media_session = None
+        allocated_rtp_port = None
+        
+        if media_service:
+            media_session = await media_service.get_session(call_id)
+            if media_session and media_session.local_port:
+                allocated_rtp_port = media_session.local_port
+                log.info(f"[ARI-ORCHESTRATION] ✅ Media session allocated RTP port: {allocated_rtp_port}")
+            else:
+                log.warning(f"[ARI-ORCHESTRATION] ⚠️ Could not get RTP port from media session")
+        
+        if not allocated_rtp_port:
+            log.error(f"[ARI-ORCHESTRATION] ❌ Failed to allocate RTP port for {call_id}")
+            return False
+
+        # ========== STEP 2: Create mixing bridge ==========
+        from ..transport.asterisk import create_bridge, add_channel_to_bridge, create_external_media
+        
+        bridge_id = await create_bridge("mixing")
+        if not bridge_id:
+            log.error(f"[ARI-ORCHESTRATION] ❌ Failed to create bridge for {call_id}")
+            return False
+        
+        log.info(f"[ARI-ORCHESTRATION] ✅ Bridge created: {bridge_id}")
+
+        # ========== STEP 3: Add original caller channel to bridge ==========
+        added_caller = await add_channel_to_bridge(bridge_id, call_id)
+        if not added_caller:
+            log.error(f"[ARI-ORCHESTRATION] ❌ Failed to add caller channel {call_id} to bridge {bridge_id}")
+            return False
+        
+        log.info(f"[ARI-ORCHESTRATION] ✅ Caller channel {call_id} added to bridge {bridge_id}")
+
+        # ========== STEP 4: Create ExternalMedia channel with RTP port ==========
+        external_media_response = await create_external_media(
+            call_id=call_id,
+            formats="ulaw",
+            rtp_ip="163.223.186.31",  # MY_PC_IP from config
+            rtp_port=allocated_rtp_port
+        )
+        
+        if not external_media_response:
+            log.error(f"[ARI-ORCHESTRATION] ❌ Failed to create ExternalMedia channel for {call_id}")
+            return False
+        
+        external_channel_id = external_media_response.get("id")
+        log.info(f"[ARI-ORCHESTRATION] ✅ ExternalMedia channel created: {external_channel_id}")
+        log.info(f"[ARI-ORCHESTRATION]    RTP endpoint: 163.223.186.31:{allocated_rtp_port}")
+
+        # ========== STEP 5: Add ExternalMedia channel to bridge ==========
+        added_external = await add_channel_to_bridge(bridge_id, external_channel_id)
+        if not added_external:
+            log.error(f"[ARI-ORCHESTRATION] ❌ Failed to add ExternalMedia {external_channel_id} to bridge {bridge_id}")
+            return False
+        
+        log.info(f"[ARI-ORCHESTRATION] ✅ ExternalMedia channel {external_channel_id} added to bridge {bridge_id}")
+
+        # ========== DIAGNOSTIC SUMMARY ==========
+        log.info(f"[ARI-ORCHESTRATION] ✅✅✅ BRIDGE ORCHESTRATION COMPLETE FOR {call_id}")
+        log.info(f"[ARI-ORCHESTRATION] Bridge ID: {bridge_id}")
+        log.info(f"[ARI-ORCHESTRATION] Caller Channel: {call_id} → {bridge_id}")
+        log.info(f"[ARI-ORCHESTRATION] ExternalMedia Channel: {external_channel_id} → {bridge_id}")
+        log.info(f"[ARI-ORCHESTRATION] RTP Reception Point: 163.223.186.31:{allocated_rtp_port}")
+        log.info(f"[ARI-ORCHESTRATION] Asterisk will now mix caller ↔ ExternalMedia bidirectionally")
+
+        # Initialize customer requirement collection
+        try:
+            from ..services.customer_requirement_service import get_customer_requirement_service
+            req_service = get_customer_requirement_service()
+            if req_service:
+                await req_service.initialize_call(call_id)
+                log.info(f"[ARI] Requirement collection initialized: {call_id}")
+        except Exception as e:
+            log.warning(f"[ARI] Failed to initialize requirements: {e}")
+        
+        # Trigger greeting
+        try:
+            from ..services.greeting_service import get_greeting_service
+            greeting_service = get_greeting_service()
+            if greeting_service:
+                await greeting_service.play_greeting(call_id)
+                log.info(f"[ARI] ✅ Greeting triggered: {call_id}")
+        except Exception as e:
+            log.warning(f"[ARI] Failed to trigger greeting: {e}")
+        
+        # Start listening for audio
+        live_handler = get_live_call_handler()
+        if live_handler:
+            await live_handler.start_listening(call_id)
+
+        return True
 
     except Exception as e:
-        log.error(f"[ARI] StasisStart error: {e}")
+        log.error(f"[ARI] StasisStart error: {e}", exc_info=True)
         return False
 
 

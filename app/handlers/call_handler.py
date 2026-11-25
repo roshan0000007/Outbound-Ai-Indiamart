@@ -194,12 +194,21 @@ class CallHandler:
                 if req_service and lead_service:
                     requirements = await req_service.get_requirements(call_id)
                     if requirements:
-                        # Save to Google Sheets instead of database
-                        result = await lead_service.save_requirements(requirements)
-                        if result.get("success"):
-                            log.info(f"[CallHandler] ✅ Saved requirements to Google Sheets: {call_id}")
+                        # CRITICAL FIX: Only save to Google Sheets if conversation contains actual text
+                        # Check if conversation has any meaningful content before marking success
+                        has_valid_conversation = bool(full_conversation_text and full_conversation_text.strip())
+                        
+                        if has_valid_conversation:
+                            # Save to Google Sheets only when there's actual conversation
+                            result = await lead_service.save_requirements(requirements)
+                            if result.get("success"):
+                                log.info(f"[CallHandler] ✅ Saved requirements to Google Sheets: {call_id}")
+                            else:
+                                log.warning(f"[CallHandler] Failed to save requirements to Google Sheets: {result.get('message')}")
                         else:
-                            log.warning(f"[CallHandler] Failed to save requirements to Google Sheets: {result.get('message')}")
+                            log.info(f"[CallHandler] ⓘ No conversation text captured - skipping Google Sheets save for {call_id}")
+                    else:
+                        log.info(f"[CallHandler] ⓘ No requirements collected for {call_id}")
                     
                     # Cleanup requirement collection state
                     await req_service.cleanup_call(call_id)
