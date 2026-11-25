@@ -47,7 +47,7 @@ class LiveCallHandler:
     async def start_listening(self, call_id: str, language: str = "en") -> bool:
         """
         Start listening for audio on a call
-        Initializes Gemini Live audio streaming
+        Initializes Gemini Live audio streaming and connects RTP to Gemini
         
         Args:
             call_id: Call ID
@@ -65,11 +65,57 @@ class LiveCallHandler:
                 language=language
             )
             
-            if result and result.get("success"):
-                log.info(f"[LiveCall] ✅ Audio listening started: {call_id}")
-                return True
-            else:
+            if not result or not result.get("success"):
                 log.error(f"[LiveCall] Failed to start audio listening: {call_id}")
+                return False
+            
+            # CRITICAL: Get media session and connect RTP ↔ Gemini bidirectional streaming
+            try:
+                from ..services.media_service import get_media_service
+                from ..services.gemini_audio_pipeline import get_gemini_audio_session
+                
+                media_service = get_media_service()
+                if not media_service:
+                    log.error(f"[LiveCall] Media service not available")
+                    return False
+                
+                # Get media session created for this call
+                media_session = await media_service.get_session(call_id)
+                if not media_session:
+                    log.error(f"[LiveCall] Media session not found for {call_id}")
+                    return False
+                
+                # Get Gemini audio session
+                gemini_session = await get_gemini_audio_session(call_id)
+                if not gemini_session:
+                    log.error(f"[LiveCall] Gemini audio session not found for {call_id}")
+                    return False
+                
+                # Start bidirectional RTP ↔ Gemini audio streaming
+                log.info(f"[LiveCall] Connecting RTP ↔ Gemini Live bidirectional streaming for {call_id}")
+                
+                async def run_audio_streaming():
+                    """Run audio streaming as background task"""
+                    try:
+                        await media_session.stream_audio_via_gemini(
+                            gemini_session=gemini_session,
+                            on_response_audio=None,
+                            on_response_text=None
+                        )
+                    except Exception as e:
+                        log.error(f"[LiveCall] Audio streaming error: {e}")
+                
+                # Start streaming as background task (don't await, let it run independently)
+                asyncio.create_task(run_audio_streaming())
+                
+                log.info(f"[LiveCall] ✅ Audio listening started: {call_id}")
+                log.info(f"[LiveCall]    ├─ RTP audio → Gemini Live (input)")
+                log.info(f"[LiveCall]    └─ Gemini Live → RTP audio (output)")
+                
+                return True
+                
+            except Exception as e:
+                log.error(f"[LiveCall] Error connecting audio streams: {e}", exc_info=True)
                 return False
                 
         except Exception as e:
