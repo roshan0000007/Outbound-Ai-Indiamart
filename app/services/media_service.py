@@ -10,6 +10,7 @@ import asyncio
 import struct
 import time
 import logging
+from datetime import datetime
 from typing import Optional, Dict, Tuple, Callable
 from collections import deque
 from dataclasses import dataclass
@@ -1474,6 +1475,40 @@ class MediaServiceManager:
                 log.info(f"[MEDIA-SERVICE] Session closed: {call_id}")
         except Exception as e:
             log.error(f"[MEDIA-SERVICE] close_session error: {e}")
+
+    async def release_call_resources(self, call_id: str) -> bool:
+        """
+        Release all resources for a call
+        Called when a call ends - cleans up RTP port, session, buffers
+        
+        Args:
+            call_id: Call ID to cleanup
+            
+        Returns:
+            bool: True if successful
+        """
+        try:
+            log.info(f"[MEDIA-SERVICE] Releasing resources for call: {call_id}")
+            
+            # Close the session (which will close RTP socket)
+            await self.close_session(call_id)
+            
+            # Get the port that was used for this call
+            async with self.lock:
+                session = self.sessions.get(call_id)
+                if session and hasattr(session, 'rtp_port'):
+                    port = session.rtp_port
+                    # Return port to pool after quarantine period
+                    if port not in self.port_quarantine:
+                        self.port_quarantine[port] = datetime.now().timestamp()
+                        log.debug(f"[MEDIA-SERVICE] Quarantined port {port} for call {call_id}")
+            
+            log.info(f"[MEDIA-SERVICE] ✅ Resources released for call {call_id}")
+            return True
+            
+        except Exception as e:
+            log.error(f"[MEDIA-SERVICE] Error releasing resources: {e}")
+            return False
 
     async def shutdown(self):
         """Shutdown all sessions"""

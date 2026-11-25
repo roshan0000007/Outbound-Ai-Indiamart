@@ -84,8 +84,12 @@ class GeminiLiveProvider:
         """
         try:
             if not self.client:
-                log.error("[Gemini Live] Client not initialized")
-                return False
+                log.error("[Gemini Live] Client not initialized - attempting re-initialization")
+                # Try to re-initialize the client
+                init_success = await self.initialize()
+                if not init_success:
+                    log.error("[Gemini Live] Client initialization failed")
+                    return False
 
             # Generate session ID
             self.session_id = f"session_{int(datetime.utcnow().timestamp() * 1000)}"

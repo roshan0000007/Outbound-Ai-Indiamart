@@ -175,7 +175,7 @@ class CallHandler:
                 log.warning(f"[CallHandler] Failed to save/cleanup requirements: {e}", exc_info=True)
 
             # Close session
-            await session_mgr.delete_session(call_id)
+            await session_mgr.close_session(call_id)
             log.info(f"[CallHandler] ✅ Session closed for {call_id}")
             return True
 
