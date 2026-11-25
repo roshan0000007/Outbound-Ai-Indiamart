@@ -1,10 +1,11 @@
 """
-Gemini Live Provider - Speech-to-Speech audio streaming (google-genai SDK)
+Gemini Live Provider - Speech-to-speech audio streaming (google-genai SDK)
 
 Audio contract:
-  Input  : 16 kHz, 16-bit mono PCM bytes (upsample the 8 kHz caller audio first)
+  Input  : 16 kHz, 16-bit mono PCM bytes. Upsample the 8 kHz caller audio first.
   Output : Gemini replies with 24 kHz, 16-bit mono PCM bytes.
-           Use pcm24k_to_pcmu8k() before sending the audio to RTP.
+           stream_audio_bidirectional() also converts each reply chunk to
+           8 kHz G.711 mu-law and passes it to on_ulaw_chunk, ready for RTP.
 """
 
 import os
@@ -17,16 +18,54 @@ from ..core.config import log
 
 INPUT_MIME = "audio/pcm;rate=16000"
 DEFAULT_SYSTEM_PROMPT = "You are a helpful sales assistant. Respond concisely and naturally."
+DEFAULT_TEXT_SYSTEM_PROMPT = "You are a professional sales assistant."
 
 
-def pcm24k_to_pcmu8k(pcm24k: bytes, state=None):
+class OutboundResampler:
     """
-    Convert Gemini's 24 kHz 16-bit mono PCM into 8 kHz G.711 mu-law bytes for RTP.
-    Pass the returned state back on the next call so resampling stays continuous.
-    Returns (ulaw_bytes, state).
+    Converts Gemini's 24 kHz 16-bit PCM into 8 kHz mu-law for RTP.
+
+    Keeps resampler state across calls and buffers about 100 ms of input before
+    converting. Converting single small chunks with no state produces empty output.
+    Create one instance per call.
     """
-    pcm8k, state = audioop.ratecv(pcm24k, 2, 1, 24000, 8000, state)
-    return audioop.lin2ulaw(pcm8k, 2), state
+
+    SRC_RATE = 24000
+    DST_RATE = 8000
+    MIN_BYTES = SRC_RATE * 2 // 10  # 100 ms of 16-bit mono at 24 kHz
+
+    def __init__(self):
+        self._buf = bytearray()
+        self._state = None
+
+    def push(self, pcm24k: bytes) -> bytes:
+        """Add 24 kHz PCM. Returns mu-law bytes once enough audio is buffered, else b''."""
+        self._buf.extend(pcm24k)
+        if len(self._buf) < self.MIN_BYTES:
+            return b""
+        return self._convert(self._take())
+
+    def flush(self) -> bytes:
+        """Convert whatever is left at the end of a reply."""
+        if not self._buf:
+            return b""
+        return self._convert(self._take())
+
+    def _take(self) -> bytes:
+        chunk = bytes(self._buf)
+        self._buf.clear()
+        # Keep only whole 16-bit samples
+        if len(chunk) % 2:
+            chunk = chunk[:-1]
+        return chunk
+
+    def _convert(self, pcm24k: bytes) -> bytes:
+        if not pcm24k:
+            return b""
+        pcm8k, self._state = audioop.ratecv(
+            pcm24k, 2, 1, self.SRC_RATE, self.DST_RATE, self._state
+        )
+        return audioop.lin2ulaw(pcm8k, 2)
 
 
 class GeminiLiveProvider:
@@ -46,7 +85,6 @@ class GeminiLiveProvider:
         self.session_id = None
         self.audio_config = {"encoding": "LINEAR16", "sample_rate_hertz": 16000}
 
-        # Set once a session is created; reset for each call
         self.session_ready_event = asyncio.Event()
 
     # ------------------------------------------------------------------ #
@@ -78,7 +116,7 @@ class GeminiLiveProvider:
             return False
 
     async def create_live_session(self, system_prompt: Optional[str] = None) -> bool:
-        """Create the per-call session record. The WebSocket opens in stream_audio_bidirectional."""
+        """Create the per-call session record. The WebSocket opens in stream_audio_bidirectional()."""
         try:
             if not self.client and not await self.initialize():
                 return False
@@ -109,6 +147,7 @@ class GeminiLiveProvider:
         self,
         audio_input_stream: AsyncIterator[bytes],
         on_audio_chunk: Optional[Callable[[bytes], None]] = None,
+        on_ulaw_chunk: Optional[Callable[[bytes], None]] = None,
         on_text_chunk: Optional[Callable[[str], None]] = None,
         greeting_text: Optional[str] = None,
     ) -> Optional[bytes]:
@@ -116,11 +155,12 @@ class GeminiLiveProvider:
         Stream caller audio to Gemini Live and route its audio reply back.
 
         audio_input_stream: yields 16 kHz 16-bit mono PCM bytes.
-        on_audio_chunk:     receives 24 kHz 16-bit mono PCM bytes from Gemini.
-        on_text_chunk:      receives text transcripts of Gemini's reply.
+        on_audio_chunk:     raw 24 kHz 16-bit mono PCM from Gemini (optional).
+        on_ulaw_chunk:      8 kHz mu-law bytes ready for RTP (use this for the call).
+        on_text_chunk:      text transcript of Gemini's reply.
         greeting_text:      optional text Gemini speaks first.
 
-        Returns the full reply audio (24 kHz PCM), or None.
+        Returns the full reply audio as 24 kHz PCM, or None.
         """
         from google.genai import types
 
@@ -147,7 +187,14 @@ class GeminiLiveProvider:
         response_audio = bytearray()
         frame_count = 0
         response_chunks = 0
-        turn_done = asyncio.Event()
+        sent_all = asyncio.Event()     # caller audio fully sent
+        turn_done = asyncio.Event()    # Gemini finished replying after the caller audio
+        greeting_pending = bool(greeting_text)
+        resampler = OutboundResampler()
+
+        def emit_ulaw(ulaw: bytes):
+            if ulaw and on_ulaw_chunk:
+                on_ulaw_chunk(ulaw)
 
         try:
             async with self.client.aio.live.connect(model=model_name, config=config) as live:
@@ -162,23 +209,31 @@ class GeminiLiveProvider:
 
                 async def send_audio():
                     nonlocal frame_count
-                    async for chunk in audio_input_stream:
-                        if not chunk:
-                            continue
-                        await live.send_realtime_input(
-                            audio=types.Blob(data=chunk, mime_type=INPUT_MIME)
-                        )
-                        frame_count += 1
-                    log.info(f"[Gemini Live] Caller audio sent: {frame_count} frames")
+                    try:
+                        async for chunk in audio_input_stream:
+                            if not chunk:
+                                continue
+                            await live.send_realtime_input(
+                                audio=types.Blob(data=chunk, mime_type=INPUT_MIME)
+                            )
+                            frame_count += 1
+                    except asyncio.CancelledError:
+                        log.warning(f"[Gemini Live] Caller audio generator cancelled after {frame_count} frames")
+                        raise
+                    finally:
+                        log.info(f"[Gemini Live] Caller audio sent: {frame_count} frames")
+                        sent_all.set()
 
                 async def receive_audio():
-                    nonlocal response_chunks
-                    # receive() yields messages for the current turn; loop to keep reading
-                    while True:
+                    nonlocal response_chunks, greeting_pending
+                    while not turn_done.is_set():
+                        got_message = False
                         async for message in live.receive():
+                            got_message = True
                             sc = message.server_content
                             if sc is None:
                                 continue
+
                             if sc.model_turn and sc.model_turn.parts:
                                 for part in sc.model_turn.parts:
                                     if part.text and on_text_chunk:
@@ -186,20 +241,36 @@ class GeminiLiveProvider:
                                     if part.inline_data and part.inline_data.data:
                                         data = part.inline_data.data
                                         response_chunks += 1
+                                        log.info(
+                                            f"[Gemini Live] Reply chunk {response_chunks}: "
+                                            f"{len(data)} bytes, mime={part.inline_data.mime_type}"
+                                        )
                                         response_audio.extend(data)
                                         if on_audio_chunk:
                                             on_audio_chunk(data)
+                                        emit_ulaw(resampler.push(data))
+
                             if sc.turn_complete:
-                                turn_done.set()
+                                # The greeting's turn completes first; ignore it.
+                                if greeting_pending and not sent_all.is_set():
+                                    greeting_pending = False
+                                    log.info("[Gemini Live] Greeting reply complete")
+                                    continue
+                                if sent_all.is_set():
+                                    turn_done.set()
+                                    return
+
+                        if not got_message:
+                            break  # stream closed by the server
 
                 send_task = asyncio.create_task(send_audio())
                 recv_task = asyncio.create_task(receive_audio())
                 try:
-                    await send_task
-                    # Wait for Gemini to finish replying to the last caller audio
+                    await sent_all.wait()
+                    # Give Gemini time to answer the last caller utterance
                     await asyncio.wait_for(turn_done.wait(), timeout=self.reply_timeout)
                 except asyncio.TimeoutError:
-                    log.warning(f"[Gemini Live] No turn completion within {self.reply_timeout}s")
+                    log.warning(f"[Gemini Live] No turn completion within {self.reply_timeout}s after caller audio")
                 finally:
                     for t in (send_task, recv_task):
                         t.cancel()
@@ -210,6 +281,9 @@ class GeminiLiveProvider:
                 f"[Gemini Live] Streaming failed (frames sent: {frame_count}): {e}",
                 exc_info=True,
             )
+
+        # Flush the last partial block of resampled audio
+        emit_ulaw(resampler.flush())
 
         log.info(
             f"[Gemini Live] Done: sent={frame_count} frames, "
@@ -231,7 +305,7 @@ class GeminiLiveProvider:
                 model=self.text_model,
                 contents=prompt,
                 config=types.GenerateContentConfig(
-                    system_instruction=system_prompt or "You are a professional sales assistant.",
+                    system_instruction=system_prompt or DEFAULT_TEXT_SYSTEM_PROMPT,
                     temperature=self.temperature,
                     max_output_tokens=self.max_tokens,
                 ),
@@ -258,7 +332,7 @@ class GeminiLiveProvider:
                 model=self.text_model,
                 contents=prompt,
                 config=types.GenerateContentConfig(
-                    system_instruction=system_prompt or "You are a professional sales assistant.",
+                    system_instruction=system_prompt or DEFAULT_TEXT_SYSTEM_PROMPT,
                     temperature=self.temperature,
                     max_output_tokens=self.max_tokens,
                 ),
