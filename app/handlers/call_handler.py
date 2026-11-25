@@ -3,6 +3,7 @@ Call Lifecycle Handlers
 Handles call start and end events
 """
 
+import asyncio
 from typing import Optional, Dict, Any
 from datetime import datetime
 
@@ -121,6 +122,9 @@ class CallHandler:
         """
         When call ends - save conversation and cleanup
         
+        CRITICAL FIX: Wait for Gemini stream to fully close before extracting data
+        This prevents race condition where requirements are still being written to Redis
+        
         Args:
             call_id: Call ID
             
@@ -129,6 +133,23 @@ class CallHandler:
         """
         try:
             log.info(f"[CallHandler] Call end: {call_id}")
+
+            # 🔧 CRITICAL: Wait for Gemini session to fully close (max 3 seconds)
+            try:
+                from ..services.gemini_audio_pipeline import get_gemini_audio_session
+                gemini_session = await get_gemini_audio_session(call_id)
+                if gemini_session:
+                    log.info(f"[CallHandler] ⏳ Waiting for Gemini session to close for {call_id}...")
+                    # Wait for session_active to become False or timeout
+                    for attempt in range(30):  # 30 * 100ms = 3 seconds
+                        if not gemini_session.session_active:
+                            log.info(f"[CallHandler] ✅ Gemini session closed")
+                            break
+                        await asyncio.sleep(0.1)
+                    else:
+                        log.warning(f"[CallHandler] ⚠️ Gemini session timeout, continuing anyway")
+            except Exception as e:
+                log.debug(f"[CallHandler] Error waiting for Gemini close: {e}")
 
             session_mgr = get_call_session()
             if not session_mgr:
@@ -141,6 +162,21 @@ class CallHandler:
                 return False
 
             try:
+                # 🔧 FIX: Get requirements from BOTH Gemini session AND RequirementService
+                from ..services.customer_requirement_service import get_customer_requirement_service
+                from ..services.requirement_tools_service import get_requirement_tools_service
+                from ..services.lead_storage_service import get_lead_storage_service
+                
+                req_service = get_customer_requirement_service()
+                requirement_tools = get_requirement_tools_service()
+                lead_service = get_lead_storage_service()
+                
+                # Get collected requirements
+                requirements = None
+                if req_service:
+                    requirements = await req_service.get_requirements(call_id)
+                    log.info(f"[CallHandler] ✅ Requirements fetched: {requirements}")
+                
                 # Build complete conversation text from all messages
                 conversation = session.get("conversation", [])
                 conversation_parts = []
@@ -151,106 +187,58 @@ class CallHandler:
                     text = message.get("text", "")
                     if text:
                         conversation_parts.append(f"{sender}: {text}")
-                    
-                    # Track language from messages
-                    msg_lang = message.get("language", "en")
-                    if msg_lang and msg_lang != "en":
-                        detected_language = msg_lang
-                
-                # Build full conversation text with one insert query
-                full_conversation_text = "\n".join(conversation_parts) if conversation_parts else ""
-                
-                if full_conversation_text:
-                    # Get call metadata from session
-                    user_id = session.get("user_id", 0)
-                    caller_number = session.get("caller_number", "Unknown")
-                    call_start_time = session.get("created_at")
-                    call_end_time = datetime.utcnow()
-                    
-                    # Calculate call duration
-                    call_duration = 0
-                    if call_start_time:
-                        if isinstance(call_start_time, str):
-                            from dateutil import parser as date_parser
-                            call_start_time = date_parser.parse(call_start_time)
-                        call_duration = int((call_end_time - call_start_time).total_seconds())
-                    
-                    # Save to conversation_history table in one query
-                    insert_sql = """
-                        INSERT INTO conversation_history
-                        (call_id, userid, caller_number, conversation_text, detected_language,
-                         call_duration, call_start_time, call_end_time)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                        ON DUPLICATE KEY UPDATE
-                            conversation_text = %s,
-                            detected_language = %s,
-                            call_duration = %s,
-                            call_end_time = %s
-                    """
-                    
-                    params = (
-                        call_id, user_id, caller_number, full_conversation_text, detected_language,
-                        call_duration, call_start_time, call_end_time,
-                        full_conversation_text, detected_language, call_duration, call_end_time
-                    )
-                    
-                    await execute_insert(insert_sql, params)
-                    log.info(f"[CallHandler] ✅ Saved complete conversation to conversation_history for {call_id}: {len(conversation)} messages")
-                else:
-                    log.warning(f"[CallHandler] No conversation text to save for {call_id}")
-                    
-            except Exception as e:
-                log.warning(f"[CallHandler] Could not save conversation: {e}", exc_info=True)
-
-            # Save requirements to Google Sheets on call hangup
-            try:
-                from ..services.customer_requirement_service import get_customer_requirement_service
-                from ..services.lead_storage_service import get_lead_storage_service
-                
-                req_service = get_customer_requirement_service()
-                lead_service = get_lead_storage_service()
-                
-                if req_service and lead_service:
-                    requirements = await req_service.get_requirements(call_id)
-                    if requirements:
-                        # CRITICAL FIX: Only save to Google Sheets if conversation contains actual text
-                        # Check if conversation has any meaningful content before marking success
-                        has_valid_conversation = bool(full_conversation_text and full_conversation_text.strip())
                         
-                        if has_valid_conversation:
-                            # Save to Google Sheets only when there's actual conversation
-                            result = await lead_service.save_requirements(requirements)
-                            if result.get("success"):
-                                log.info(f"[CallHandler] ✅ Saved requirements to Google Sheets: {call_id}")
-                            else:
-                                log.warning(f"[CallHandler] Failed to save requirements to Google Sheets: {result.get('message')}")
-                        else:
-                            log.info(f"[CallHandler] ⓘ No conversation text captured - skipping Google Sheets save for {call_id}")
+                        # Detect language from first non-empty message
+                        from ..services.language_service import get_language_service
+                        lang_service = get_language_service()
+                        if lang_service and detected_language == "en":
+                            detected_language = lang_service.detect_language(text)
+                
+                full_conversation_text = "\n".join(conversation_parts)
+                
+                # 🔧 FIX: Save requirements even if conversation is empty
+                # (Gemini might have collected data but not logged it in conversation table)
+                if requirements:
+                    log.info(f"[CallHandler] 💾 Saving requirements to Google Sheets for {call_id}")
+                    result = await lead_service.save_requirements(requirements)
+                    if result:
+                        log.info(f"[CallHandler] ✅ Requirements saved to Google Sheets")
                     else:
-                        log.info(f"[CallHandler] ⓘ No requirements collected for {call_id}")
-                    
-                    # Cleanup requirement collection state
+                        log.warning(f"[CallHandler] ⚠️ Failed to save requirements")
+                else:
+                    log.warning(f"[CallHandler] ⚠️ No requirements found for {call_id}")
+                
+                # Save conversation if exists
+                if full_conversation_text and full_conversation_text.strip():
+                    try:
+                        query = """
+                            INSERT INTO conversation_history 
+                            (call_id, participant_type, message_text, language, created_at)
+                            VALUES (%s, %s, %s, %s, %s)
+                        """
+                        await execute_insert(query, [
+                            call_id,
+                            "CONVERSATION",
+                            full_conversation_text[:5000],  # Limit length
+                            detected_language,
+                            datetime.utcnow()
+                        ])
+                        log.info(f"[CallHandler] ✅ Conversation saved to database")
+                    except Exception as e:
+                        log.warning(f"[CallHandler] Error saving conversation: {e}")
+                else:
+                    log.info(f"[CallHandler] ℹ️ No conversation text, skipping conversation save")
+                
+                # Cleanup requirements from Redis
+                if req_service:
                     await req_service.cleanup_call(call_id)
-                    log.info(f"[CallHandler] Requirement state cleaned up: {call_id}")
-            except Exception as e:
-                log.warning(f"[CallHandler] Failed to save/cleanup requirements: {e}", exc_info=True)
+                    log.info(f"[CallHandler] ✅ Requirements cleaned up from Redis")
+                
+                return True
 
-            # Close session
-            await session_mgr.close_session(call_id)
-            log.info(f"[CallHandler] ✅ Session closed for {call_id}")
-            
-            # Cleanup LLM failover service for this call
-            try:
-                from ..services.llm_failover_service import get_llm_failover_service
-                failover_service = get_llm_failover_service()
-                if failover_service:
-                    stats = await failover_service.cleanup_call(call_id)
-                    if stats:
-                        log.info(f"[CallHandler] LLM failover stats: {stats}")
             except Exception as e:
-                log.warning(f"[CallHandler] Error cleaning up failover service: {e}")
-            
-            return True
+                log.error(f"[CallHandler] Error processing call end: {e}", exc_info=True)
+                return False
 
         except Exception as e:
             log.error(f"[CallHandler] on_call_end error: {e}")

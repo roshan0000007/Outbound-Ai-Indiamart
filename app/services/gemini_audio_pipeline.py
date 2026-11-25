@@ -160,6 +160,9 @@ class GeminiAudioSession:
         """
         Queue one caller audio frame for Gemini.
         Must be 16 kHz 16-bit mono PCM (one 20 ms frame = 640 bytes).
+        
+        🔧 CRITICAL: Drop audio until language is confirmed.
+        This ensures Gemini doesn't start before DTMF language selection.
         """
         try:
             if not self.session_active:
@@ -167,6 +170,12 @@ class GeminiAudioSession:
                 return False
             if not audio_chunk:
                 return True
+
+            # 🔧 GATE: Drop audio until language is selected
+            if not self.language_selected:
+                # Audio is captured during language menu but discarded
+                # This prevents Gemini from starting prematurely
+                return True  # Accept silently but drop
 
             try:
                 self.audio_buffer.put_nowait(audio_chunk)

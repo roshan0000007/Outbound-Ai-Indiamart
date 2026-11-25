@@ -149,6 +149,41 @@ class CustomerRequirementService:
             log.error(f"[ReqService] Error updating requirements: {e}")
             return False
 
+    async def get_requirements(self, call_id: str) -> Optional[Dict[str, Any]]:
+        """Get all requirements for a call, including both collected and pending fields"""
+        try:
+            state = await self.get_call_state(call_id)
+            if not state:
+                return None
+            
+            return {
+                "call_id": call_id,
+                "collected": state.data,
+                "pending_fields": state.get_pending_fields(),
+                "is_complete": state.is_complete(),
+                "field_count": len([v for v in state.data.values() if v])
+            }
+        except Exception as e:
+            log.error(f"[ReqService] Error getting requirements: {e}")
+            return None
+
+    async def cleanup_call(self, call_id: str) -> bool:
+        """Clean up call state from memory and Redis"""
+        try:
+            # Remove from memory
+            if call_id in self.call_states:
+                del self.call_states[call_id]
+            
+            # Remove from Redis
+            from ..core.redis import delete_session
+            await delete_session(f"req:{call_id}")
+            
+            log.info(f"[ReqService] Cleaned up call state for {call_id}")
+            return True
+        except Exception as e:
+            log.error(f"[ReqService] Error cleaning up call: {e}")
+            return False
+    
     async def validate_requirements(self, call_id: str) -> Dict[str, Any]:
         """Validate current requirements state"""
         try:

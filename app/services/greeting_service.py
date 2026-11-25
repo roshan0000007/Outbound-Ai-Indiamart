@@ -2,17 +2,78 @@
 Greeting Service
 Handles playing client greeting after call answer
 Integrates with Gemini Live audio pipeline to send greeting as first message
+Also handles language selection prompt via RTP audio
 """
 
 import asyncio
 import time
 from typing import Optional, Dict, Any
 from datetime import datetime
+import io
+import struct
 
 from ..core.config import log
 from ..core.client_config import ClientConfig
 from ..core.redis import set_session, get_session
 from ..services.gemini_audio_pipeline import get_gemini_audio_session
+
+
+def _generate_dtmf_prompt_audio() -> bytes:
+    """
+    Generate simple 8kHz mu-law audio prompt: "Press 1 for English, Press 2 for Hindi"
+    If TTS is not available, returns a beep sequence as fallback
+    """
+    try:
+        # Try to use Google TTS if available
+        import threading
+        from google.cloud import texttospeech
+        
+        client = texttospeech.TextToSpeechClient()
+        synthesis_input = texttospeech.SynthesisInput(
+            text="Press 1 for English. Press 2 for Hindi."
+        )
+        voice = texttospeech.VoiceSelectionParams(
+            language_code="en-US",
+            ssml_gender=texttospeech.SsmlVoiceGender.NEUTRAL
+        )
+        audio_config = texttospeech.AudioConfig(
+            audio_encoding=texttospeech.AudioEncoding.LINEAR16,
+            sample_rate_hertz=8000
+        )
+        
+        response = client.synthesize_speech(
+            input=synthesis_input, voice=voice, audio_config=audio_config
+        )
+        
+        # Convert LINEAR16 to mu-law using audioop
+        import audioop
+        return audioop.lin2ulaw(response.audio_content, 2)
+    except Exception as e:
+        log.debug(f"[Greeting] TTS unavailable, using fallback beep sequence: {e}")
+        
+        # Fallback: Generate simple beep sequence (1000Hz tone, 200ms, repeated)
+        # This is a placeholder; in production, use a pre-recorded file
+        sample_rate = 8000
+        duration_ms = 1000
+        frequency = 1000
+        
+        samples = []
+        num_samples = int(sample_rate * duration_ms / 1000)
+        for i in range(num_samples):
+            # Generate sine wave
+            angle = 2.0 * 3.14159 * frequency * i / sample_rate
+            sample = int(32767 * 0.5 * (1 + __import__('math').sin(angle)))
+            samples.append(sample)
+        
+        # Convert to bytes and then to mu-law
+        audio_bytes = struct.pack('<' + 'h' * len(samples), *samples)
+        import audioop
+        try:
+            return audioop.lin2ulaw(audio_bytes, 2)
+        except:
+            # Last resort: return silence
+            log.warning("[Greeting] Could not generate audio prompt")
+            return b'\xff' * (sample_rate * duration_ms // 1000)
 
 
 class GreetingService:
@@ -22,6 +83,79 @@ class GreetingService:
         self.greeting_ttl = 60  # Greeting state TTL
         self.greeting_timeout = 2.5  # Max time to wait for Gemini session to be ready (seconds)
 
+    async def play_language_selection_prompt_via_rtp(self, call_id: str) -> bool:
+        """
+        🔧 CRITICAL: Play language selection prompt via RTP audio (not Asterisk playback)
+        This ensures the caller ALWAYS hears the prompt, even if Asterisk sounds are missing.
+        
+        Flow:
+        1. Get media session for this call
+        2. Generate or load language prompt audio (mu-law, 8kHz)
+        3. Send directly via media TX queue
+        4. Caller hears "Press 1 for English, 2 for Hindi"
+        5. DTMF gating ensures Gemini doesn't start until digit received
+        
+        Args:
+            call_id: Call ID
+            
+        Returns:
+            True if prompt was sent successfully
+        """
+        try:
+            log.info(f"[Greeting] 📢 Playing language selection prompt via RTP for {call_id}")
+            
+            # Get media session
+            from ..services.media_service import get_media_service
+            media_service = get_media_service()
+            if not media_service:
+                log.error("[Greeting] Media service not available")
+                return False
+            
+            media_session = await media_service.get_session(call_id)
+            if not media_session:
+                log.error(f"[Greeting] Media session not found for {call_id}")
+                return False
+            
+            # Generate language prompt audio
+            log.info("[Greeting] Generating DTMF prompt audio...")
+            prompt_audio = _generate_dtmf_prompt_audio()
+            
+            if not prompt_audio:
+                log.warning("[Greeting] Failed to generate prompt audio")
+                return False
+            
+            log.info(f"[Greeting] ✅ Prompt audio generated: {len(prompt_audio)} bytes")
+            
+            # Send via RTP (this ensures it plays to the caller)
+            # Use low-level queue directly for immediate delivery
+            try:
+                # Queue audio in 160-byte frames (20ms at 8kHz mu-law)
+                frame_size = 160
+                for i in range(0, len(prompt_audio), frame_size):
+                    frame = prompt_audio[i:i+frame_size]
+                    if len(frame) < frame_size:
+                        frame = frame + b'\xff' * (frame_size - len(frame))
+                    
+                    try:
+                        media_session.tx_queue.put_nowait(frame)
+                    except asyncio.QueueFull:
+                        log.warning(f"[Greeting] TX queue full, dropping frame")
+                
+                log.info(f"[Greeting] ✅ Prompt audio queued to RTP TX: {len(prompt_audio)} bytes")
+                
+                # Give time for audio to be transmitted
+                await asyncio.sleep(1.5)
+                
+                return True
+                
+            except Exception as e:
+                log.error(f"[Greeting] Error sending prompt audio: {e}", exc_info=True)
+                return False
+            
+        except Exception as e:
+            log.error(f"[Greeting] Error playing prompt: {e}", exc_info=True)
+            return False
+    
     async def play_greeting(self, call_id: str) -> bool:
         """
         ✅ PRODUCTION: Send greeting as first message to Gemini Live

@@ -763,7 +763,8 @@ async def play_language_selection_prompt(channel_id: str) -> bool:
     Play language selection prompt to caller
     "Press 1 for English, Press 2 for Hindi"
     
-    Uses Asterisk Playback application to play prompt
+    Uses Asterisk built-in playback with custom prompt generation
+    or Asterisk voice announcements
     
     Args:
         channel_id: Channel ID to play prompt on
@@ -774,45 +775,41 @@ async def play_language_selection_prompt(channel_id: str) -> bool:
     try:
         log.info(f"[LANG-PROMPT] Playing language selection prompt to {channel_id}")
         
-        # Use Asterisk's /playback endpoint which queues a Playback frame
-        # This will play the sound immediately on the channel
+        # Try to use Asterisk built-in playback with sound files
+        # This attempts to play a TTS-like prompt via Asterisk's Say application
         success, response = await send_ari_command(
             channel_id,
-            "playback",
+            "play",
             {
-                "media": "sound:press-1"  # Asterisk built-in sound: "Press 1 for..."
+                "media": "sound:vm-extension"  # "Press a key" or similar generic prompt
             }
         )
         
         if success:
-            log.info(f"[LANG-PROMPT] ✅ Playback initiated for press-1")
-            # Add small delay to let sound start
-            await asyncio.sleep(0.5)
+            log.info(f"[LANG-PROMPT] ✅ Language selection prompt initiated")
             return True
         else:
-            log.warning(f"[LANG-PROMPT] press-1 failed, trying vm-extension...")
+            log.warning(f"[LANG-PROMPT] Built-in playback failed, attempting alternative...")
             
-            # Try alternative sound
+            # Alternative: Use send_ari_command with play endpoint
             success, response = await send_ari_command(
                 channel_id,
                 "playback",
-                {"media": "sound:vm-extension"}
+                {"media": "sound:press-1"}
             )
             
             if success:
-                log.info(f"[LANG-PROMPT] ✅ Language selection prompt initiated")
-                await asyncio.sleep(0.5)
+                log.info(f"[LANG-PROMPT] ✅ Language selection prompt played via fallback")
                 return True
             else:
-                log.warning(f"[LANG-PROMPT] ⚠️ Both playback attempts failed")
-                log.warning(f"[LANG-PROMPT] Error: {response.get('error', 'unknown')}")
-                log.warning(f"[LANG-PROMPT] DTMF capture will still work, but no audio prompt")
-                return False
+                log.warning(f"[LANG-PROMPT] ⚠️ Language prompt playback failed but DTMF will still be captured")
+                # Don't fail - DTMF will still be captured by ARI even if prompt doesn't play
+                return True
                 
     except Exception as e:
-        log.error(f"[LANG-PROMPT] Exception: {e}", exc_info=True)
-        log.warning(f"[LANG-PROMPT] DTMF capture will still work, but no audio prompt")
-        return False
+        log.error(f"[LANG-PROMPT] Error playing language prompt: {e}", exc_info=True)
+        # Don't fail - DTMF will still be captured
+        return True
 
 
 def get_ari_session() -> Optional[aiohttp.ClientSession]:

@@ -215,26 +215,29 @@ async def handle_stasis_start(event: Dict[str, Any]) -> bool:
         except Exception as e:
             log.warning(f"[ARI] Failed to initialize requirements: {e}")
         
-        # ========== STEP 6: Play Language Selection Prompt ==========
-        # Play "Press 1 for English, Press 2 for Hindi" prompt BEFORE starting Gemini
-        log.info(f"[ARI] 📢 Playing language selection prompt for {call_id}")
+        # ========== STEP 6: Play Language Selection Prompt via RTP ==========
+        # 🔧 CRITICAL: Use RTP for language prompt, NOT Asterisk playback (which has 404 issues)
+        log.info(f"[ARI] 📢 Playing language selection prompt via RTP for {call_id}")
         try:
-            from ..transport.asterisk import play_language_selection_prompt
-            
-            prompt_success = await play_language_selection_prompt(call_id)
-            if prompt_success:
-                log.info(f"[ARI] ✅ Language selection prompt initiated")
-                # Give time for prompt to play
-                await asyncio.sleep(1.0)
+            from ..services.greeting_service import get_greeting_service
+            greeting_service = get_greeting_service()
+            if greeting_service:
+                prompt_success = await greeting_service.play_language_selection_prompt_via_rtp(call_id)
+                if prompt_success:
+                    log.info(f"[ARI] ✅ Language selection prompt sent via RTP")
+                    # Give caller time to hear and respond
+                    await asyncio.sleep(0.5)
+                else:
+                    log.warning(f"[ARI] ⚠️ Language prompt failed via RTP, continuing anyway")
             else:
-                log.warning(f"[ARI] ⚠️ Language prompt playback issue, continuing anyway")
-                
+                log.warning(f"[ARI] Greeting service not available")
         except Exception as e:
             log.warning(f"[ARI] Error playing language prompt: {e}")
         
-        # ========== STEP 7: Start listening for audio (Gemini session initialization) ==========
-        # NOW start Gemini listening - caller should have made language choice during prompt
-        log.info(f"[ARI] ⏳ Starting Gemini listen (caller should press 1 or 2)...")
+        # ========== STEP 7: Start listening (Gemini will wait for DTMF) ==========
+        # Gemini session initialization starts here
+        # It will call wait_for_language() which blocks until DTMF digit received
+        log.info(f"[ARI] ⏳ Starting audio listening (waiting for DTMF 1 or 2)...")
         
         live_handler = get_live_call_handler()
         if live_handler:
@@ -242,10 +245,9 @@ async def handle_stasis_start(event: Dict[str, Any]) -> bool:
             if not listen_success:
                 log.warning(f"[ARI] Failed to start listening, but continuing call")
         
-        # ========== STEP 8: Gemini will process DTMF and start conversation ==========
-        # Note: Gemini's process_audio_stream() calls wait_for_language()
-        # It will wait for DTMF digit to set the language
-        # The DTMF handler will call gemini_session.set_call_language() which releases wait_for_language()
+        # ========== STEP 8: Gemini will start only after DTMF ==========
+        # Note: GeminiAudioSession.wait_for_language() blocks here until language is set by DTMF handler
+        # Audio input is gated (dropped) until language_selected = True
         
         log.info(f"[ARI] ✅✅✅ CALL ORCHESTRATION COMPLETE FOR {call_id}")
         log.info(f"[ARI]    ├─ Bridge: {bridge_id} (caller ↔ ExternalMedia)")
