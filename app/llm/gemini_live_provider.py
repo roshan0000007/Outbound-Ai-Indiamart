@@ -8,6 +8,7 @@ import os
 import asyncio
 import json
 import base64
+import time
 from typing import Optional, Dict, Any, Callable, AsyncIterator
 from datetime import datetime
 
@@ -124,51 +125,168 @@ class GeminiLiveProvider:
         on_text_chunk: Optional[Callable[[str], None]] = None
     ) -> Optional[bytes]:
         """
-        Bidirectional audio streaming - fallback to text processing with audio pass-through
+        ✅ FIX #2: Proper bidirectional audio streaming via Gemini Live WebSocket
+        
+        Implements full Gemini Live speech-to-speech pipeline:
+        - Opens persistent WebSocket connection via live.connect()
+        - Sends caller's audio (PCM16 8kHz) to Gemini in real-time
+        - Receives Gemini's response audio back as PCM16
+        - Calls callbacks for audio chunks and interim text
         
         Args:
-            audio_input_stream: Async iterator providing audio chunks
-            on_audio_chunk: Callback for each audio response chunk
-            on_text_chunk: Callback for interim text
+            audio_input_stream: Async iterator providing caller audio chunks (8kHz PCM16)
+            on_audio_chunk: Callback for each response audio chunk from Gemini
+            on_text_chunk: Callback for interim text responses
             
         Returns:
-            Response audio bytes
+            Response audio bytes (complete concatenation)
         """
         try:
+            from google import genai
+            
             if not self.session or not self.client:
-                log.error("[Gemini Live] Session not active")
+                log.error("[Gemini Live] ❌ Session not active - cannot stream audio")
                 return None
 
-            log.info(f"[Gemini Live] Starting audio stream processing: {self.session_id}")
+            log.info(f"[Gemini Live] 🎤 Starting bidirectional audio streaming: {self.session_id}")
+            log.info(f"[Gemini Live]    ├─ Opening WebSocket connection to Gemini Live API")
+            log.info(f"[Gemini Live]    ├─ Audio format: PCM16 @ {self.audio_config['sample_rate_hertz']}Hz")
+            log.info(f"[Gemini Live]    ├─ System prompt: {self.session.get('system_prompt', 'default')[:50]}...")
+            log.info(f"[Gemini Live]    └─ Waiting for caller audio and Gemini responses...")
 
             response_audio = bytearray()
-            
+            frame_count = 0
+            response_frames = 0
+            last_log_time = time.time()
+
             try:
-                # Process audio stream with timeout
-                frame_count = 0
-                async for audio_chunk in audio_input_stream:
-                    if audio_chunk:
-                        frame_count += 1
-                        # Pass through audio chunks directly for now
-                        # In production, would send to Gemini for processing
-                        if on_audio_chunk:
-                            on_audio_chunk(audio_chunk)
-                    
-                    # Timeout after processing many frames
-                    if frame_count > 1000:
-                        break
-                    
-                    await asyncio.sleep(0.001)
-                
-                log.info(f"[Gemini Live] Audio stream processed: {frame_count} frames, {len(response_audio)} bytes")
-                return bytes(response_audio) if response_audio else None
+                # ✅ FIX #2: Create proper WebSocket connection with live.connect()
+                async with self.client.aio.live.connect(
+                    model=self.model,
+                    config=genai.types.LiveConnectConfig(
+                        generation_config=genai.types.GenerationConfig(
+                            temperature=self.temperature,
+                            max_output_tokens=self.max_tokens,
+                        ),
+                        system_instruction=self.session.get('system_prompt', 
+                            "You are a helpful sales assistant. Respond concisely and naturally."),
+                    ),
+                ) as session:
+                    log.info(f"[Gemini Live] ✅ WebSocket connected to Gemini Live API")
+                    log.info(f"[Gemini Live]    └─ Ready for bidirectional streaming")
+
+                    # Create concurrent tasks for sending and receiving
+                    async def send_audio_to_gemini():
+                        """Feed caller audio to Gemini"""
+                        try:
+                            nonlocal frame_count
+                            async for audio_chunk in audio_input_stream:
+                                if audio_chunk and len(audio_chunk) > 0:
+                                    frame_count += 1
+                                    
+                                    # Send audio chunk to Gemini
+                                    await session.send(
+                                        genai.types.LiveClientMessage(
+                                            realtime_input=genai.types.LiveClientRealtimeInput(
+                                                media_chunks=[
+                                                    genai.types.MediaChunk(
+                                                        data=audio_chunk,
+                                                        mime_type="audio/pcm;rate=8000"
+                                                    )
+                                                ]
+                                            )
+                                        )
+                                    )
+                                    
+                                    if frame_count % 50 == 0:
+                                        log.debug(f"[Gemini Live] 📤 Sent {frame_count} caller audio frames to Gemini")
+                                
+                                await asyncio.sleep(0.001)
+                            
+                            # Signal end of audio
+                            log.info(f"[Gemini Live] Audio input complete: {frame_count} frames sent")
+                            
+                        except asyncio.CancelledError:
+                            log.info(f"[Gemini Live] Audio send task cancelled")
+                            raise
+                        except Exception as e:
+                            log.error(f"[Gemini Live] ❌ Error sending audio to Gemini: {e}", exc_info=True)
+                            raise
+
+                    async def receive_audio_from_gemini():
+                        """Receive response audio and text from Gemini"""
+                        try:
+                            nonlocal response_frames
+                            
+                            async for response in session.receive():
+                                # Handle server content (text responses)
+                                if response.server_content:
+                                    if response.server_content.model_turn:
+                                        # Process model turn response
+                                        for part in response.server_content.model_turn.parts:
+                                            # Handle text
+                                            if part.text:
+                                                log.info(f"[Gemini Live] 💬 Text response: {part.text[:100]}...")
+                                                if on_text_chunk:
+                                                    on_text_chunk(part.text)
+                                            
+                                            # Handle audio response
+                                            if part.inline_data and part.inline_data.data:
+                                                audio_data = part.inline_data.data
+                                                response_frames += 1
+                                                response_audio.extend(audio_data)
+                                                
+                                                log.debug(f"[Gemini Live] 📥 Response audio chunk {response_frames}: {len(audio_data)} bytes")
+                                                
+                                                if on_audio_chunk:
+                                                    on_audio_chunk(audio_data)
+                                    
+                                    # Handle server messages
+                                    if response.server_content.server_message:
+                                        msg = response.server_content.server_message
+                                        log.debug(f"[Gemini Live] 📨 Server message: {msg}")
+                            
+                            log.info(f"[Gemini Live] ✅ Audio stream complete: {response_frames} response frames received")
+                            
+                        except asyncio.CancelledError:
+                            log.info(f"[Gemini Live] Audio receive task cancelled")
+                            raise
+                        except Exception as e:
+                            log.error(f"[Gemini Live] ❌ Error receiving audio from Gemini: {e}", exc_info=True)
+                            raise
+
+                    # Run send and receive concurrently
+                    try:
+                        await asyncio.gather(
+                            send_audio_to_gemini(),
+                            receive_audio_from_gemini(),
+                            return_exceptions=False
+                        )
+                    except Exception as gather_error:
+                        log.error(f"[Gemini Live] ❌ Concurrent streaming error: {gather_error}", exc_info=True)
+                        raise
+
+                    log.info(f"[Gemini Live] ✅ Bidirectional streaming complete")
+                    log.info(f"[Gemini Live]    ├─ Caller audio: {frame_count} frames sent")
+                    log.info(f"[Gemini Live]    ├─ Gemini response: {response_frames} frames received")
+                    log.info(f"[Gemini Live]    ├─ Response audio size: {len(response_audio)} bytes")
+                    log.info(f"[Gemini Live]    └─ Ready for next turn")
 
             except Exception as e:
-                log.error(f"[Gemini Live] Stream processing error: {e}")
+                log.error(f"[Gemini Live] ❌ Gemini stream processing failed: {e}", exc_info=True)
+                log.error(f"[Gemini Live]    Session: {self.session_id}")
+                log.error(f"[Gemini Live]    Frames sent: {frame_count}")
+                log.error(f"[Gemini Live]    Response frames received: {response_frames}")
                 return bytes(response_audio) if response_audio else None
 
+            return bytes(response_audio) if response_audio else None
+
+        except ImportError:
+            log.error("[Gemini Live] ❌ google-genai not installed")
+            log.error("[Gemini Live] Install: pip install google-genai")
+            return None
         except Exception as e:
-            log.error(f"[Gemini Live] Bidirectional streaming error: {e}")
+            log.error(f"[Gemini Live] ❌ Bidirectional streaming error: {e}", exc_info=True)
             return None
 
     async def _send_audio_stream_genai(

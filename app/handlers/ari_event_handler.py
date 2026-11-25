@@ -63,6 +63,11 @@ async def handle_stasis_start(event: Dict[str, Any]) -> bool:
     """
     Handle StasisStart event - new call incoming
     
+    ✅ FIX #1: Ignore external-* channels (ExternalMedia channels we created)
+    When we create an ExternalMedia channel via ARI, Asterisk enters it into Stasis.
+    This triggers StasisStart again, but it's NOT a new incoming call - it's OUR channel.
+    We detect and ignore these to prevent duplicate call initialization.
+    
     CRITICAL ORCHESTRATION SEQUENCE:
     1. Initialize call session and media (creates RTP socket, binds to MY_PC_IP:port)
     2. Create mixing bridge
@@ -85,6 +90,12 @@ async def handle_stasis_start(event: Dict[str, Any]) -> bool:
         if not call_id:
             log.error("[ARI] StasisStart: missing call_id")
             return False
+
+        # ✅ FIX #1: Ignore external-* channels (ExternalMedia channels we created)
+        if call_id.startswith("external-"):
+            log.info(f"[ARI] ✅ Ignoring ExternalMedia channel StasisStart: {call_id}")
+            log.info(f"[ARI]    └─ This is our RTP bridge channel (not an incoming call)")
+            return True  # Return True (success), just don't process it
 
         dnid = extract_dnid(channel)
         caller_number = extract_caller_number(channel)
