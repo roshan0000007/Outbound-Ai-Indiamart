@@ -16,6 +16,7 @@ NOTES:
   long as the call lasts. Only GEMINI_CALL_MAX_SEC caps the total duration.
 - The GeminiLiveProvider instance is shared across calls, so this service never
   calls create_live_session() for health checks (that would replace the shared session).
+- The call language ("en" or "hi") is passed per call and is never stored on the provider.
 """
 
 import os
@@ -51,7 +52,7 @@ class LLMFailoverService:
         self.groq_timeout_sec = float(os.getenv("GROQ_TIMEOUT_SEC", "5"))
         self.recovery_check_interval_sec = float(os.getenv("GEMINI_RECOVERY_CHECK_SEC", "10"))
 
-        log.info("[LLM-FAILOVER] ✅ Service initialized")
+        log.info("[LLM-FAILOVER] Service initialized")
         log.info("[LLM-FAILOVER]    ├─ Primary: Gemini Live (speech-to-speech)")
         log.info("[LLM-FAILOVER]    ├─ Fallback: Groq LLM (text inference)")
         log.info(f"[LLM-FAILOVER]    ├─ Gemini max call duration: {self.gemini_call_max_sec}s")
@@ -70,7 +71,7 @@ class LLMFailoverService:
                 "recovery_attempted_at": None,
                 "mode_switches": 0,
             }
-            log.info(f"[LLM-FAILOVER:{call_id}] ✅ Call initialized - starting with Gemini Live")
+            log.info(f"[LLM-FAILOVER:{call_id}] Call initialized - starting with Gemini Live")
             return True
         except Exception as e:
             log.error(f"[LLM-FAILOVER:{call_id}] Error initializing: {e}")
@@ -84,20 +85,23 @@ class LLMFailoverService:
         on_interrupted: Optional[Callable[[], None]] = None,
         on_audio_chunk: Optional[Callable[[bytes], None]] = None,
         on_text_chunk: Optional[Callable[[str], None]] = None,
+        on_field_saved: Optional[Callable[[str, str], None]] = None,
+        on_call_complete: Optional[Callable[[], None]] = None,
         greeting_text: Optional[str] = None,
+        call_language: str = "en",
     ) -> Optional[bytes]:
         """
-        Run the Gemini Live conversation for the whole call.
+        Run the Gemini Live conversation for the whole call, in one language.
 
         Returns the reply audio (24 kHz PCM) or None if Gemini could not be used.
         Caller audio keeps flowing until audio_input_stream ends or GEMINI_CALL_MAX_SEC passes.
         """
         if not self.gemini_provider:
-            log.error(f"[LLM-FAILOVER:{call_id}] ❌ Gemini provider not available")
+            log.error(f"[LLM-FAILOVER:{call_id}] Gemini provider not available")
             await self._record_gemini_failure(call_id, "provider_not_initialized")
             return None
 
-        log.info(f"[LLM-FAILOVER:{call_id}] 🎯 Attempting Gemini Live conversation...")
+        log.info(f"[LLM-FAILOVER:{call_id}] Attempting Gemini Live conversation (language: {call_language})...")
 
         try:
             response_audio = await asyncio.wait_for(
@@ -107,23 +111,26 @@ class LLMFailoverService:
                     on_interrupted=on_interrupted,
                     on_audio_chunk=on_audio_chunk,
                     on_text_chunk=on_text_chunk,
+                    on_field_saved=on_field_saved,
+                    on_call_complete=on_call_complete,
                     greeting_text=greeting_text,
+                    call_language=call_language,
                 ),
                 timeout=self.gemini_call_max_sec,
             )
-            log.info(f"[LLM-FAILOVER:{call_id}] ✅ Gemini Live conversation ended normally")
+            log.info(f"[LLM-FAILOVER:{call_id}] Gemini Live conversation ended normally")
             return response_audio
 
         except asyncio.TimeoutError:
             # Reached the safety cap on call length. This is not a Gemini failure.
             log.warning(
-                f"[LLM-FAILOVER:{call_id}] ⚠️ Call reached max duration "
+                f"[LLM-FAILOVER:{call_id}] Call reached max duration "
                 f"({self.gemini_call_max_sec}s); ending Gemini session"
             )
             return None
 
         except Exception as e:
-            log.error(f"[LLM-FAILOVER:{call_id}] ❌ Gemini Live error: {e}", exc_info=True)
+            log.error(f"[LLM-FAILOVER:{call_id}] Gemini Live error: {e}", exc_info=True)
             await self._record_gemini_failure(call_id, f"error: {str(e)[:50]}")
             return None
 
@@ -138,13 +145,13 @@ class LLMFailoverService:
         try:
             await self._switch_mode(call_id, LLMMode.GROQ_FALLBACK)
 
-            log.info(f"[LLM-FAILOVER:{call_id}] 🔄 SWITCHING TO GROQ FALLBACK")
+            log.info(f"[LLM-FAILOVER:{call_id}] SWITCHING TO GROQ FALLBACK")
             log.info(f"[LLM-FAILOVER:{call_id}]    ├─ Reason: Gemini unavailable")
             log.info(f"[LLM-FAILOVER:{call_id}]    └─ Using Groq LLM for text responses")
 
             if not self.groq_provider.client:
                 if not await self.groq_provider.initialize():
-                    log.error(f"[LLM-FAILOVER:{call_id}] ❌ Failed to initialize Groq")
+                    log.error(f"[LLM-FAILOVER:{call_id}] Failed to initialize Groq")
                     return None
 
             response = await asyncio.wait_for(
@@ -153,16 +160,16 @@ class LLMFailoverService:
             )
 
             if response:
-                log.info(f"[LLM-FAILOVER:{call_id}] ✅ Groq response: {len(response)} chars")
+                log.info(f"[LLM-FAILOVER:{call_id}] Groq response: {len(response)} chars")
             else:
-                log.error(f"[LLM-FAILOVER:{call_id}] ❌ Groq returned empty response")
+                log.error(f"[LLM-FAILOVER:{call_id}] Groq returned empty response")
             return response
 
         except asyncio.TimeoutError:
-            log.error(f"[LLM-FAILOVER:{call_id}] ❌ Groq timeout ({self.groq_timeout_sec}s)")
+            log.error(f"[LLM-FAILOVER:{call_id}] Groq timeout ({self.groq_timeout_sec}s)")
             return None
         except Exception as e:
-            log.error(f"[LLM-FAILOVER:{call_id}] ❌ Groq error: {e}")
+            log.error(f"[LLM-FAILOVER:{call_id}] Groq error: {e}")
             return None
 
     async def check_gemini_recovery(self, call_id: str) -> bool:
@@ -187,12 +194,12 @@ class LLMFailoverService:
             if client is None:
                 return False
 
-            log.info(f"[LLM-FAILOVER:{call_id}] 🔍 Checking Gemini recovery...")
+            log.info(f"[LLM-FAILOVER:{call_id}] Checking Gemini recovery...")
             pager = await asyncio.wait_for(client.aio.models.list(config={"page_size": 1}), timeout=2.0)
             # Awaiting the call is enough to prove the API is reachable
             del pager
 
-            log.info(f"[LLM-FAILOVER:{call_id}] ✅ Gemini reachable again - switching back to Gemini Live")
+            log.info(f"[LLM-FAILOVER:{call_id}] Gemini reachable again - switching back to Gemini Live")
             await self._switch_mode(call_id, LLMMode.GEMINI_LIVE)
             state["gemini_failed"] = False
             return True
@@ -215,7 +222,7 @@ class LLMFailoverService:
                 state["gemini_failed"] = True
                 state["gemini_failure_reason"] = reason
                 state["gemini_failure_time"] = datetime.utcnow()
-                log.error(f"[LLM-FAILOVER:{call_id}] ❌ GEMINI FAILURE RECORDED: {reason}")
+                log.error(f"[LLM-FAILOVER:{call_id}] GEMINI FAILURE RECORDED: {reason}")
         except Exception as e:
             log.error(f"[LLM-FAILOVER:{call_id}] Error recording failure: {e}")
 
@@ -230,8 +237,8 @@ class LLMFailoverService:
             state["mode"] = new_mode
             state["mode_switches"] += 1
             log.info(
-                f"[LLM-FAILOVER:{call_id}] 🔄 MODE SWITCH #{state['mode_switches']}: "
-                f"{old_mode.value} → {new_mode.value}"
+                f"[LLM-FAILOVER:{call_id}] MODE SWITCH #{state['mode_switches']}: "
+                f"{old_mode.value} -> {new_mode.value}"
             )
             if new_mode == LLMMode.GROQ_FALLBACK:
                 state["fallback_started_at"] = datetime.utcnow()
