@@ -201,19 +201,9 @@ class GeminiLiveProvider:
                                         frame_count += 1
                                         
                                         try:
-                                            # Send audio chunk to Gemini
-                                            await session.send(
-                                                genai.types.LiveClientMessage(
-                                                    realtime_input=genai.types.LiveClientRealtimeInput(
-                                                        media_chunks=[
-                                                            genai.types.MediaChunk(
-                                                                data=audio_chunk,
-                                                                mime_type="audio/pcm;rate=8000"
-                                                            )
-                                                        ]
-                                                    )
-                                                )
-                                            )
+                                            # Send audio chunk directly to Gemini
+                                            # The session.send() method accepts the audio data directly
+                                            await session.send(audio_chunk)
                                         except Exception as send_error:
                                             log.error(f"[Gemini Live] Error sending audio chunk: {send_error}")
                                             break
@@ -238,32 +228,38 @@ class GeminiLiveProvider:
                                 nonlocal response_frames
                                 
                                 async for response in session.receive():
-                                    # Handle server content (text responses)
-                                    if response.server_content:
-                                        if response.server_content.model_turn:
-                                            # Process model turn response
-                                            for part in response.server_content.model_turn.parts:
-                                                # Handle text
-                                                if part.text:
-                                                    log.info(f"[Gemini Live] 💬 Text response: {part.text[:100]}...")
-                                                    if on_text_chunk:
-                                                        on_text_chunk(part.text)
-                                                
-                                                # Handle audio response
-                                                if part.inline_data and part.inline_data.data:
-                                                    audio_data = part.inline_data.data
-                                                    response_frames += 1
-                                                    response_audio.extend(audio_data)
+                                    # Handle server content
+                                    try:
+                                        if hasattr(response, 'server_content') and response.server_content:
+                                            if hasattr(response.server_content, 'model_turn') and response.server_content.model_turn:
+                                                # Process model turn response
+                                                for part in response.server_content.model_turn.parts:
+                                                    # Handle text
+                                                    if hasattr(part, 'text') and part.text:
+                                                        log.info(f"[Gemini Live] 💬 Text response: {part.text[:100]}...")
+                                                        if on_text_chunk:
+                                                            on_text_chunk(part.text)
                                                     
-                                                    log.debug(f"[Gemini Live] 📥 Response audio chunk {response_frames}: {len(audio_data)} bytes")
-                                                    
-                                                    if on_audio_chunk:
-                                                        on_audio_chunk(audio_data)
-                                        
-                                        # Handle server messages
-                                        if response.server_content.server_message:
-                                            msg = response.server_content.server_message
-                                            log.debug(f"[Gemini Live] 📨 Server message: {msg}")
+                                                    # Handle audio response
+                                                    if hasattr(part, 'inline_data') and part.inline_data:
+                                                        if hasattr(part.inline_data, 'data'):
+                                                            audio_data = part.inline_data.data
+                                                            if audio_data:
+                                                                response_frames += 1
+                                                                response_audio.extend(audio_data)
+                                                                
+                                                                log.debug(f"[Gemini Live] 📥 Response audio chunk {response_frames}: {len(audio_data)} bytes")
+                                                                
+                                                                if on_audio_chunk:
+                                                                    on_audio_chunk(audio_data)
+                                            
+                                            # Handle server messages
+                                            if hasattr(response.server_content, 'server_message') and response.server_content.server_message:
+                                                msg = response.server_content.server_message
+                                                log.debug(f"[Gemini Live] 📨 Server message: {msg}")
+                                    except Exception as parse_error:
+                                        log.debug(f"[Gemini Live] Error parsing response: {parse_error}")
+                                        continue
                                 
                                 log.info(f"[Gemini Live] ✅ Audio stream complete: {response_frames} response frames received")
                                 
@@ -428,7 +424,7 @@ class GeminiLiveProvider:
                 log.info(f"[Gemini Live] 🎵 Sending greeting text to Gemini Live for audio synthesis...")
                 
                 try:
-                    # Use Live API for audio response
+                    # Use Live API for audio response with simplified message format
                     model_name = self.model
                     if not model_name.startswith("models/"):
                         model_name = f"models/{model_name}"
@@ -447,51 +443,43 @@ class GeminiLiveProvider:
                     ) as session:
                         log.info(f"[Gemini Live] 🔌 Connected to Live API for greeting audio synthesis")
                         
-                        # Send prompt
-                        await session.send(
-                            genai.types.LiveClientMessage(
-                                realtime_input=genai.types.LiveClientRealtimeInput(
-                                    media_chunks=[]  # No audio input for greeting
-                                )
-                            )
-                        )
+                        # Send text prompt directly
+                        await session.send(prompt)
                         
-                        # Send text prompt
-                        await session.send(
-                            genai.types.LiveClientMessage(
-                                client_content=genai.types.ClientContent(
-                                    turns=[
-                                        genai.types.Content(
-                                            role="user",
-                                            parts=[
-                                                genai.types.Part(text=prompt)
-                                            ]
-                                        )
-                                    ],
-                                    turn_complete=True
-                                )
-                            )
-                        )
-                        
-                        log.info(f"[Gemini Live] 📤 Greeting prompt sent, waiting for audio response...")
+                        log.info(f"[Gemini Live] 📤 Greeting prompt sent: '{prompt[:80]}...'")
+                        log.info(f"[Gemini Live] ⏳ Waiting for audio response...")
                         
                         response_audio = bytearray()
                         frame_count = 0
                         
                         # Receive audio response
                         async for response in session.receive():
-                            if response.server_content and response.server_content.model_turn:
-                                for part in response.server_content.model_turn.parts:
-                                    if part.inline_data and part.inline_data.data:
-                                        audio_data = part.inline_data.data
-                                        frame_count += 1
-                                        response_audio.extend(audio_data)
-                                        
-                                        log.debug(f"[Gemini Live] 📥 Greeting audio chunk {frame_count}: {len(audio_data)} bytes")
-                                        
-                                        # Callback with audio chunk
-                                        if on_audio_chunk:
-                                            on_audio_chunk(audio_data)
+                            try:
+                                # Check if response has server_content
+                                if hasattr(response, 'server_content') and response.server_content:
+                                    if hasattr(response.server_content, 'model_turn') and response.server_content.model_turn:
+                                        for part in response.server_content.model_turn.parts:
+                                            # Check for inline_data (audio)
+                                            if hasattr(part, 'inline_data') and part.inline_data:
+                                                if hasattr(part.inline_data, 'data'):
+                                                    audio_data = part.inline_data.data
+                                                    if audio_data:
+                                                        frame_count += 1
+                                                        response_audio.extend(audio_data)
+                                                        
+                                                        log.debug(f"[Gemini Live] 📥 Greeting audio chunk {frame_count}: {len(audio_data)} bytes")
+                                                        
+                                                        # Callback with audio chunk
+                                                        if on_audio_chunk:
+                                                            on_audio_chunk(audio_data)
+                                            
+                                            # Check for text in response
+                                            if hasattr(part, 'text') and part.text:
+                                                log.debug(f"[Gemini Live] 💬 Response text: {part.text[:80]}...")
+                            
+                            except Exception as e:
+                                log.debug(f"[Gemini Live] Error processing response chunk: {e}")
+                                continue
                         
                         log.info(f"[Gemini Live] ✅ Greeting audio complete: {frame_count} frames, {len(response_audio)} bytes total")
                         return bytes(response_audio) if response_audio else None
