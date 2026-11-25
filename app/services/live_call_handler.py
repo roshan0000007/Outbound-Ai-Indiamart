@@ -44,6 +44,62 @@ class LiveCallHandler:
         log.info("[LiveCall] Handler initialized - Ready for Gemini audio streaming")
         return True
 
+    async def start_listening(self, call_id: str, language: str = "en") -> bool:
+        """
+        Start listening for audio on a call
+        Initializes Gemini Live audio streaming
+        
+        Args:
+            call_id: Call ID
+            language: Language code (default: en)
+            
+        Returns:
+            True if successful
+        """
+        try:
+            log.info(f"[LiveCall] Starting audio listening: {call_id}")
+            
+            # Start Gemini audio stream
+            result = await self.start_call_audio_stream(
+                call_id=call_id,
+                language=language
+            )
+            
+            if result and result.get("success"):
+                log.info(f"[LiveCall] ✅ Audio listening started: {call_id}")
+                return True
+            else:
+                log.error(f"[LiveCall] Failed to start audio listening: {call_id}")
+                return False
+                
+        except Exception as e:
+            log.error(f"[LiveCall] Error starting listening: {e}")
+            return False
+
+    async def stop_listening(self, call_id: str) -> bool:
+        """
+        Stop listening for audio on a call
+        Closes Gemini Live audio streaming
+        
+        Args:
+            call_id: Call ID
+            
+        Returns:
+            True if successful
+        """
+        try:
+            log.info(f"[LiveCall] Stopping audio listening: {call_id}")
+            
+            # End Gemini audio session
+            await end_gemini_audio_session(call_id)
+            
+            log.info(f"[LiveCall] ✅ Audio listening stopped: {call_id}")
+            return True
+            
+        except Exception as e:
+            log.error(f"[LiveCall] Error stopping listening: {e}")
+            return False
+
     async def start_call_audio_stream(
         self,
         call_id: str,

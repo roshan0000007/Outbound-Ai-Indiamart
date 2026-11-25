@@ -22,6 +22,7 @@ class GreetingService:
     async def play_greeting(self, call_id: str) -> bool:
         """
         Play the client greeting for a call
+        Uses Gemini Live to deliver the greeting as audio
         
         Args:
             call_id: Unique call identifier
@@ -49,10 +50,24 @@ class GreetingService:
             # Mark greeting as played in state
             await self._mark_greeting_played(call_id)
             
-            # Greeting is delivered via Gemini Live audio streaming
-            log.info(f"[Greeting] Greeting will be delivered via Gemini Live")
-            
-            return True
+            # Send greeting text through Gemini Live audio streaming
+            # The media service will synthesize and play it as audio
+            try:
+                from ..services.media_service import get_media_service
+                media_service = get_media_service()
+                
+                if media_service:
+                    # Store greeting in session for Gemini to process
+                    session_data = await get_session(f"call:{call_id}")
+                    if session_data:
+                        session_data["greeting_text"] = greeting_text
+                        session_data["greeting_sent"] = True
+                        from ..core.redis import set_session
+                        await set_session(f"call:{call_id}", session_data, ttl=3600)
+                        log.info(f"[Greeting] ✅ Greeting text queued for Gemini Live: {call_id}")
+                    
+            except Exception as e:
+                log.warning(f"[Greeting] Warning sending greeting to media service: {e}")
             
             log.info(f"[Greeting] ✅ Greeting trigger set for {call_id}")
             return True
