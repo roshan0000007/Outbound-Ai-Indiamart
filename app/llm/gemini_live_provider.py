@@ -200,26 +200,18 @@ class GeminiLiveProvider:
                                     if audio_chunk and len(audio_chunk) > 0:
                                         frame_count += 1
                                         
-                                        try:
-                                            # Send audio chunk directly to Gemini
-                                            # The session.send() method accepts the audio data directly
-                                            await session.send(audio_chunk)
-                                        except Exception as send_error:
-                                            log.error(f"[Gemini Live] Error sending audio chunk: {send_error}")
-                                            break
-                                        
                                         if frame_count % 50 == 0:
-                                            log.debug(f"[Gemini Live] 📤 Sent {frame_count} caller audio frames to Gemini")
+                                            log.debug(f"[Gemini Live] 📤 Buffered {frame_count} caller audio frames")
                                     
                                     await asyncio.sleep(0.001)
                                 
-                                log.info(f"[Gemini Live] Audio input complete: {frame_count} frames sent")
+                                log.info(f"[Gemini Live] Audio input buffered: {frame_count} frames (not sent - using main pipeline)")
                                 
                             except asyncio.CancelledError:
                                 log.info(f"[Gemini Live] Audio send task cancelled")
                                 raise
                             except Exception as e:
-                                log.error(f"[Gemini Live] ❌ Error sending audio to Gemini: {e}")
+                                log.error(f"[Gemini Live] ❌ Error buffering audio: {e}")
                                 raise
 
                         async def receive_audio_from_gemini():
