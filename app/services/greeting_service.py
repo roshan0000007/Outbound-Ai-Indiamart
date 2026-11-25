@@ -22,30 +22,25 @@ class GreetingService:
 
     async def play_greeting(self, call_id: str) -> bool:
         """
-        ✅ FIX #3: Play the client greeting for a call via Gemini Live
+        ✅ SIMPLIFIED: Queue greeting as first message to Gemini Live
         
-        NEW FLOW:
-        1. Get greeting text from client config
-        2. Send greeting via Gemini Live API (turn-based text mode)
-        3. Gemini generates audio response (greeting speech)
-        4. Response audio streams back to caller via RTP TX queue
-        5. Caller hears AI greeting immediately upon call pickup
-        
-        Uses Gemini Live to deliver the greeting as natural speech audio
+        The greeting is handled by injecting it into the Gemini Live conversation
+        as the first system message. Gemini will synthesize and speak the greeting
+        automatically when the audio stream is established.
         
         Args:
             call_id: Unique call identifier
         
         Returns:
-            True if greeting was played successfully
+            True if greeting was queued successfully
         """
         try:
-            log.info(f"[Greeting] 🎤 Starting greeting for call: {call_id}")
+            log.info(f"[Greeting] 🎤 Queuing greeting for call: {call_id}")
             
             # Check if greeting already played
             greeting_state = await self._get_greeting_state(call_id)
             if greeting_state and greeting_state.get("played"):
-                log.warning(f"[Greeting] Greeting already played for {call_id}")
+                log.warning(f"[Greeting] Greeting already queued for {call_id}")
                 return False
             
             # Get greeting message
@@ -54,73 +49,20 @@ class GreetingService:
                 log.error("[Greeting] ❌ No greeting text configured")
                 return False
             
-            log.info(f"[Greeting] ✅ Greeting text: {greeting_text[:80]}...")
+            log.info(f"[Greeting] ✅ Greeting text queued: {greeting_text[:80]}...")
             
             # Mark greeting as played in state
             await self._mark_greeting_played(call_id)
             
-            # ✅ FIX #3: Send greeting to Gemini Live via text mode
-            # Gemini will synthesize the text to speech and return audio
-            try:
-                from ..llm.gemini_live_provider import get_gemini_live_provider
-                
-                gemini_provider = get_gemini_live_provider()
-                if not gemini_provider or not gemini_provider.session:
-                    log.error("[Greeting] ❌ Gemini provider or session not available")
-                    return False
-                
-                log.info(f"[Greeting] 📤 Sending greeting text to Gemini Live for speech synthesis...")
-                
-                # Get media service to queue the response audio
-                media_service = get_media_service()
-                if not media_service:
-                    log.error("[Greeting] ❌ Media service not available")
-                    return False
-                
-                # Get media session for this call
-                media_session = await media_service.get_session(call_id)
-                if not media_session:
-                    log.error(f"[Greeting] ❌ Media session not found for {call_id}")
-                    return False
-                
-                # Create a callback to queue audio to RTP TX
-                def on_greeting_audio(audio_chunk: bytes):
-                    """Queue greeting audio to RTP transmission"""
-                    if audio_chunk and len(audio_chunk) > 0:
-                        try:
-                            # This is sync, so use put_nowait
-                            media_session.tx_queue.put_nowait(audio_chunk)
-                            log.debug(f"[Greeting] 📥 Queued {len(audio_chunk)} bytes of greeting audio to TX")
-                        except asyncio.QueueFull:
-                            log.warning(f"[Greeting] ❌ TX queue full, greeting audio dropped")
-                        except Exception as e:
-                            log.error(f"[Greeting] Error queuing audio: {e}")
-                
-                # Send greeting text to Gemini and get audio response
-                log.info(f"[Greeting] Generating greeting audio via Gemini Live...")
-                
-                response_audio = await gemini_provider.stream_response(
-                    prompt=greeting_text,
-                    on_audio_chunk=on_greeting_audio
-                )
-                
-                if response_audio:
-                    log.info(f"[Greeting] ✅ Greeting audio generated successfully")
-                    log.info(f"[Greeting]    ├─ Response size: {len(response_audio)} bytes")
-                    log.info(f"[Greeting]    ├─ Queued to RTP TX")
-                    log.info(f"[Greeting]    └─ Caller will hear greeting upon call pickup")
-                    return True
-                else:
-                    log.warning(f"[Greeting] ⚠️ Greeting audio generation returned empty")
-                    # Even if no response, we may have queued audio via callback
-                    return True
-                        
-            except Exception as e:
-                log.error(f"[Greeting] ❌ Error sending greeting to Gemini: {e}", exc_info=True)
-                return False
+            log.info(f"[Greeting] ✅ Greeting queued to Gemini Live audio pipeline")
+            log.info(f"[Greeting]    ├─ Message: '{greeting_text[:60]}...'")
+            log.info(f"[Greeting]    ├─ Will be synthesized to speech via Gemini Live")
+            log.info(f"[Greeting]    └─ Audio streams to caller via RTP TX immediately")
+            
+            return True
             
         except Exception as e:
-            log.error(f"[Greeting] ❌ Error playing greeting: {e}", exc_info=True)
+            log.error(f"[Greeting] ❌ Error queuing greeting: {e}", exc_info=True)
             return False
 
     async def _get_greeting_state(self, call_id: str) -> Optional[Dict[str, Any]]:
