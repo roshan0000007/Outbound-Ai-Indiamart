@@ -1,12 +1,15 @@
 """
 Live call script for requirement collection.
-Used as the Gemini Live system instruction. The model asks the required
-questions one at a time, in order, after the greeting, in the customer's language.
+
+The provider drives the order of questions:
+  - after the greeting, it sends question 1
+  - after each saved answer (record_answer), it sends the next unanswered question
+  - after the last answer, it sends the closing instruction
+The model only words the questions and saves the answers.
 """
 
 from ..core.client_config import ClientConfig
 
-# Order matters. Each item is asked only after the previous one is answered.
 REQUIRED_QUESTIONS = [
     {
         "key": "customer_name",
@@ -58,46 +61,56 @@ REQUIRED_QUESTIONS = [
     },
 ]
 
+# Field keys the model may pass to record_answer
+RECORD_FIELDS = [q["key"] for q in REQUIRED_QUESTIONS]
 
-def _question_block(index: int, q: dict) -> str:
-    lines = [
-        f"{index}. [{q['key']}]",
-        f"   English: {q['en']}",
-        f"   Hindi: {q['hi']}",
-    ]
-    if "confirm_en" in q:
-        lines.append(f"   Confirm (English): {q['confirm_en']}")
-        lines.append(f"   Confirm (Hindi): {q['confirm_hi']}")
-    return "\n".join(lines)
+
+def question_instruction(index: int) -> str:
+    """Instruction sent by the provider to ask one question (0-based index)."""
+    q = REQUIRED_QUESTIONS[index]
+    return (
+        f"[SYSTEM INSTRUCTION] Now ask question {index + 1} of {len(REQUIRED_QUESTIONS)} "
+        f"(field: {q['key']}). Ask it naturally, in the language the customer is using. "
+        f"English wording: \"{q['en']}\". Hindi wording: \"{q['hi']}\". "
+        f"Then wait for the customer's answer. Do not ask anything else."
+    )
+
+
+def closing_instruction() -> str:
+    return (
+        "[SYSTEM INSTRUCTION] All details are collected. Say this closing message once, "
+        "warmly, in the customer's language, then end the call politely: "
+        f"\"{ClientConfig.CLOSING_MESSAGE}\""
+    )
 
 
 def build_live_system_instruction() -> str:
     questions = "\n".join(
-        _question_block(i, q) for i, q in enumerate(REQUIRED_QUESTIONS, start=1)
+        f"- {q['key']}: {q['en']}" for q in REQUIRED_QUESTIONS
     )
     return f"""
 You are a professional Indian B2B sales representative for {ClientConfig.BUSINESS_NAME}.
 You are on a live inbound phone call. The customer has just connected.
 
-CALL FLOW (follow strictly, in this order):
-1. The first instruction you receive contains the greeting. Greet the customer once,
-   in the language the customer uses, then stop and wait for the customer to reply.
-2. After the customer replies to the greeting, ask question 1 immediately.
-3. Ask ONE question per turn. As soon as the customer finishes answering, go straight
-   to the next question. Do not repeat the greeting and do not pause for long.
-4. Ask the questions in the order listed below. Skip a question only if the customer
-   has already clearly answered it earlier in this call.
-5. If an answer is unclear, incomplete, or a number has no unit, ask one short
-   clarifying question about that same item, then continue.
-   Example: "Just to confirm, is that 50,000 pieces?"
-6. If the customer gives several details in one reply, take all of them and skip
-   the questions they already answered.
-7. For the mobile number (question 8): after the customer gives it, read it back
-   digit by digit ONE time using the confirm line for the language. If the customer
-   says it is wrong, ask for the number again once, then confirm again.
-8. After all 8 items are collected and the number is confirmed, say this closing
-   message once and end the call politely:
-   "{ClientConfig.CLOSING_MESSAGE}"
+CALL FLOW:
+1. The first instruction contains the greeting. Greet the customer once, in the language
+   the customer uses, then stop and wait for the customer to reply.
+2. The system will then send you each question as an instruction. Ask only the question
+   you were sent. Ask it naturally, one question per turn.
+3. After the customer answers, call the function record_answer(field, value) with the
+   field key and the value the customer gave. Save only what the customer actually said.
+   Then wait. The system will send the next question.
+4. If an answer is unclear, incomplete, or a number has no unit, do NOT call record_answer.
+   Ask one short clarifying question about that same item instead.
+5. If the customer gives several details in one reply, call record_answer once for each
+   detail. The system will send the next unanswered question.
+6. Mobile number: after the customer gives it, read it back digit by digit once, using the
+   confirm line for the language. Call record_answer("mobile_number", digits) only after the
+   customer confirms. If they say it is wrong, ask for it again once.
+7. When you receive a closing instruction, say the closing message and end the call.
+
+FIELD KEYS for record_answer:
+{questions}
 
 LANGUAGE (strict):
 - Speak ONLY in English or Hindi. Never use any other language.
@@ -111,13 +124,11 @@ ENGLISH SPEAKING STYLE (when replying in English):
 - Use simple, warm phrases an Indian sales executive would use, such as
   "Sure, no problem", "Thank you so much", "Could you please share...", "Got it, thanks".
 - Vary your wording. Never repeat the same sentence pattern twice in a row.
-- Keep a relaxed, human rhythm: short sentences, and a brief acknowledgement before each question.
-- Do not sound like you are reading a script. Paraphrase each question naturally,
-  keeping its meaning and the order.
+- Paraphrase questions naturally, keeping their meaning. Do not sound like you are reading a script.
 
 STYLE:
 - Keep every reply to one or two short sentences.
-- Never read lists, headings, or field names aloud.
+- Never read field keys, lists, or headings aloud.
 - Sound polite and human, not robotic.
 
 RULES:
@@ -126,12 +137,9 @@ RULES:
   "Our sales team will be able to confirm those details for you."
   (Hindi: "इन विवरणों की पुष्टि हमारी सेल्स टीम करेगी।")
 - Never invent or guess the customer's name, company, location, quantity, or number.
-- Accept corrections at any time and use the latest value the customer gives.
+- Accept corrections at any time: call record_answer again with the latest value.
 - Product names the customer may use: nylon or plastic cable ties = Cable Tie;
   wire clips or cable holders = Cable Clip; wooden spoons, knives, or utensils =
   Disposable Wooden Cutlery; wooden forks = Wooden Fork; wooden bowls = Wooden Bowl.
   If the product is vague (for example "wooden items"), ask which products.
-
-QUESTIONS (ask in this order):
-{questions}
 """.strip()

@@ -6,8 +6,8 @@ Audio contract:
   Output : 24 kHz, 16-bit mono PCM from Gemini, converted to 8 kHz G.711 mu-law
            and passed to on_ulaw_chunk.
 
-Barge-in is disabled (ActivityHandling.NO_INTERRUPTION): the caller's speech during
-a reply is recorded, and Gemini answers it after the current reply finishes.
+Question flow (code-driven):
+  greeting -> question 1 -> record_answer -> next unanswered question -> ... -> closing
 """
 
 import os
@@ -18,7 +18,13 @@ from typing import Optional, Dict, Any, Callable, AsyncIterator
 from datetime import datetime
 
 from ..core.config import log
-from .live_prompt import build_live_system_instruction
+from .live_prompt import (
+    REQUIRED_QUESTIONS,
+    RECORD_FIELDS,
+    build_live_system_instruction,
+    question_instruction,
+    closing_instruction,
+)
 
 INPUT_MIME = "audio/pcm;rate=16000"
 
@@ -26,9 +32,7 @@ INPUT_MIME = "audio/pcm;rate=16000"
 class OutboundResampler:
     """
     Converts Gemini's 24 kHz 16-bit PCM into 8 kHz mu-law for RTP.
-
-    Uses a 3-sample average before each decimation step (24 kHz -> 8 kHz is exactly 3:1).
-    This reduces aliasing, the main cause of a metallic, robotic sound.
+    Averages each group of 3 samples (24 kHz -> 8 kHz is exactly 3:1) to reduce aliasing.
     Create one instance per call.
     """
 
@@ -38,7 +42,7 @@ class OutboundResampler:
         self._pending = array.array("h")
 
     def push(self, pcm24k: bytes) -> bytes:
-        usable = pcm24k[: len(pcm24k) // 2 * 2]  # whole 16-bit samples only
+        usable = pcm24k[: len(pcm24k) // 2 * 2]
         samples = array.array("h")
         samples.frombytes(usable)
         self._pending.extend(samples)
@@ -52,7 +56,6 @@ class OutboundResampler:
         return self._emit(final=True)
 
     def reset(self) -> None:
-        """Drop buffered audio, used on barge-in."""
         self._pending = array.array("h")
 
     def _emit(self, final: bool) -> bytes:
@@ -74,11 +77,31 @@ def _build_realtime_input_config(types):
             activity_handling=types.ActivityHandling.NO_INTERRUPTION,
         )
     except AttributeError:
-        log.warning(
-            "[Gemini Live] ActivityHandling.NO_INTERRUPTION not available in this SDK; "
-            "barge-in stays enabled"
-        )
+        log.warning("[Gemini Live] ActivityHandling.NO_INTERRUPTION not available; barge-in stays enabled")
         return None
+
+
+def _build_tools(types):
+    """Declare record_answer so the model can save each answer."""
+    return [types.Tool(function_declarations=[types.FunctionDeclaration(
+        name="record_answer",
+        description="Save one detail the customer just gave. Call once per detail.",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "field": types.Schema(
+                    type=types.Type.STRING,
+                    enum=RECORD_FIELDS,
+                    description="Field key from the list in the instructions",
+                ),
+                "value": types.Schema(
+                    type=types.Type.STRING,
+                    description="The value as the customer said it",
+                ),
+            },
+            required=["field", "value"],
+        ),
+    )])]
 
 
 class GeminiLiveProvider:
@@ -113,7 +136,6 @@ class GeminiLiveProvider:
             )
             log.info("[Gemini Live] Client initialized (google-genai SDK)")
             log.info(f"[Gemini Live]    ├─ Live model: {self.model}")
-            log.info(f"[Gemini Live]    ├─ Text model: {self.text_model}")
             log.info(f"[Gemini Live]    ├─ Voice: {self.voice}")
             log.info(f"[Gemini Live]    └─ Temperature: {self.temperature}, Max tokens: {self.max_tokens}")
             return True
@@ -156,17 +178,22 @@ class GeminiLiveProvider:
         on_audio_chunk: Optional[Callable[[bytes], None]] = None,
         on_text_chunk: Optional[Callable[[str], None]] = None,
         on_interrupted: Optional[Callable[[], None]] = None,
+        on_field_saved: Optional[Callable[[str, str], None]] = None,
+        on_call_complete: Optional[Callable[[], None]] = None,
         greeting_text: Optional[str] = None,
     ) -> Optional[bytes]:
         """
         Run one live conversation for the whole call.
 
-        audio_input_stream: yields 16 kHz 16-bit mono PCM until the caller hangs up.
-        on_ulaw_chunk:      8 kHz mu-law bytes ready for RTP (the call's audio output).
+        audio_input_stream: 16 kHz 16-bit mono PCM until the caller hangs up.
+        on_ulaw_chunk:      8 kHz mu-law bytes for RTP (the call's audio output).
         on_audio_chunk:     raw 24 kHz PCM from Gemini (optional, for logging only).
         on_text_chunk:      text transcript of Gemini's reply.
         on_interrupted:     only fires if barge-in is enabled (not with NO_INTERRUPTION).
-        greeting_text:      greeting Gemini speaks once, before the caller answers.
+        on_field_saved:     called as on_field_saved(field, value) for each record_answer call.
+                            Use it to write to Google Sheets / Excel.
+        on_call_complete:   called once after the closing instruction has been sent.
+        greeting_text:      greeting Gemini says once, before the first question.
 
         Returns all reply audio as 24 kHz PCM, or None.
         """
@@ -190,40 +217,55 @@ class GeminiLiveProvider:
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=self.voice)
                 )
             ),
+            tools=_build_tools(types),
         )
         realtime_cfg = _build_realtime_input_config(types)
         if realtime_cfg is not None:
             config_kwargs["realtime_input_config"] = realtime_cfg
         config = types.LiveConnectConfig(**config_kwargs)
 
-        stats = {"sent": 0, "reply_chunks": 0, "turns": 0, "interrupts": 0}
+        stats = {"sent": 0, "reply_chunks": 0, "turns": 0, "interrupts": 0, "saved": 0}
         response_audio = bytearray()
         resampler = OutboundResampler()
+
+        # Question state (owned by this call only)
+        answered: set = set()           # field keys already saved
+        question_asked: int = -1        # index of the last question sent
+        greeting_pending = bool(greeting_text)
+        closing_sent = False
 
         def emit_ulaw(ulaw: bytes):
             if ulaw and on_ulaw_chunk:
                 on_ulaw_chunk(ulaw)
+
+        def next_unanswered_index() -> Optional[int]:
+            for i, q in enumerate(REQUIRED_QUESTIONS):
+                if q["key"] not in answered:
+                    return i
+            return None
+
+        async def send_instruction(live, text: str):
+            await live.send_client_content(
+                turns=types.Content(role="user", parts=[types.Part(text=text)]),
+                turn_complete=True,
+            )
 
         try:
             async with self.client.aio.live.connect(model=model_name, config=config) as live:
                 log.info(f"[Gemini Live] WebSocket connected: {self.session_id}")
 
                 if greeting_text:
-                    # Sent as an instruction, so the model greets naturally instead of
-                    # reading the text word for word.
-                    await live.send_client_content(
-                        turns=types.Content(
-                            role="user",
-                            parts=[types.Part(text=(
-                                "The call has connected. Greet the customer once, warmly and naturally, "
-                                "in your own words, keeping the same meaning as this greeting: "
-                                + greeting_text
-                                + " Then wait for the customer to reply."
-                            ))],
-                        ),
-                        turn_complete=True,
+                    await send_instruction(
+                        live,
+                        "[SYSTEM INSTRUCTION] The call has connected. Greet the customer once, "
+                        "warmly and naturally, in your own words, keeping the same meaning as this "
+                        "greeting: " + greeting_text + " Then wait for the customer to reply.",
                     )
                     log.info("[Gemini Live] Greeting sent")
+                else:
+                    # No greeting: ask question 1 right away
+                    await send_instruction(live, question_instruction(0))
+                    question_asked = 0
 
                 async def send_audio():
                     try:
@@ -238,10 +280,48 @@ class GeminiLiveProvider:
                         log.info(f"[Gemini Live] Caller audio stream ended after {stats['sent']} frames")
 
                 async def receive_audio():
+                    nonlocal greeting_pending, question_asked, closing_sent
                     while True:
                         got_message = False
                         async for message in live.receive():
                             got_message = True
+
+                            # 1. Function calls: record_answer
+                            tool_call = getattr(message, "tool_call", None)
+                            if tool_call and tool_call.function_calls:
+                                responses = []
+                                for fc in tool_call.function_calls:
+                                    args = dict(fc.args or {})
+                                    field = str(args.get("field", "")).strip()
+                                    value = str(args.get("value", "")).strip()
+                                    if fc.name == "record_answer" and field in RECORD_FIELDS and value:
+                                        answered.add(field)
+                                        stats["saved"] += 1
+                                        log.info(f"[Gemini Live] Saved {field} = {value}")
+                                        if on_field_saved:
+                                            try:
+                                                on_field_saved(field, value)
+                                            except Exception as cb_err:
+                                                log.error(f"[Gemini Live] on_field_saved error: {cb_err}")
+                                        status = "saved"
+                                    else:
+                                        status = "rejected: unknown field or empty value"
+                                    responses.append(types.FunctionResponse(
+                                        id=fc.id, name=fc.name, response={"result": status},
+                                    ))
+                                await live.send_tool_response(function_responses=responses)
+
+                                # Ask the next unanswered question, or close the call
+                                nxt = next_unanswered_index()
+                                if nxt is None and not closing_sent:
+                                    closing_sent = True
+                                    await send_instruction(live, closing_instruction())
+                                    log.info("[Gemini Live] All details collected; closing")
+                                elif nxt is not None and nxt != question_asked and not greeting_pending:
+                                    question_asked = nxt
+                                    await send_instruction(live, question_instruction(nxt))
+                                    log.info(f"[Gemini Live] Asking question {nxt + 1}: {REQUIRED_QUESTIONS[nxt]['key']}")
+
                             sc = message.server_content
                             if sc is None:
                                 continue
@@ -269,13 +349,30 @@ class GeminiLiveProvider:
                                 stats["turns"] += 1
                                 log.info(f"[Gemini Live] Turn {stats['turns']} complete")
 
+                                # Greeting finished: ask question 1
+                                if greeting_pending:
+                                    greeting_pending = False
+                                    question_asked = 0
+                                    await send_instruction(live, question_instruction(0))
+                                    log.info("[Gemini Live] Greeting complete; asking question 1")
+
+                                # Closing finished: end the conversation
+                                if closing_sent and not answered_all_pending(answered):
+                                    if on_call_complete:
+                                        on_call_complete()
+                                    return
+
                         if not got_message:
                             log.warning("[Gemini Live] Server closed the receive stream")
                             return
 
+                def answered_all_pending(done: set) -> bool:
+                    return len(done) < len(REQUIRED_QUESTIONS)
+
                 send_task = asyncio.create_task(send_audio())
                 recv_task = asyncio.create_task(receive_audio())
                 try:
+                    # Call lasts as long as the caller's audio (or until closing finishes)
                     await send_task
                 finally:
                     recv_task.cancel()
@@ -292,8 +389,9 @@ class GeminiLiveProvider:
 
         log.info(
             f"[Gemini Live] Conversation ended: sent={stats['sent']} frames, "
-            f"turns={stats['turns']}, interrupts={stats['interrupts']}, "
-            f"reply_chunks={stats['reply_chunks']}, reply_bytes={len(response_audio)}"
+            f"turns={stats['turns']}, saved={stats['saved']}/{len(REQUIRED_QUESTIONS)}, "
+            f"interrupts={stats['interrupts']}, reply_chunks={stats['reply_chunks']}, "
+            f"reply_bytes={len(response_audio)}"
         )
         return bytes(response_audio) if response_audio else None
 
