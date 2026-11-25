@@ -26,16 +26,78 @@ _ws_task: Optional[asyncio.Task] = None
 _available_ports = set(range(START_PORT, END_PORT + 1, 2))
 _quarantined_ports: Dict[int, float] = {}
 
+def _validate_ari_config() -> bool:
+    """
+    Validate ARI configuration at startup
+    
+    Returns:
+        True if all required ARI config is present and valid, False otherwise
+    """
+    errors = []
+    
+    # Check required config variables
+    if not ARI_URL:
+        errors.append("ARI_URL is not set")
+    else:
+        log.info(f"[ARI-CONFIG] ✓ ARI_URL: {ARI_URL}")
+    
+    if not ARI_USER:
+        errors.append("ARI_USER is not set")
+    else:
+        log.info(f"[ARI-CONFIG] ✓ ARI_USER: {ARI_USER}")
+    
+    if not ARI_PASS:
+        errors.append("ARI_PASS is not set")
+    else:
+        log.info(f"[ARI-CONFIG] ✓ ARI_PASS: (configured)")
+    
+    if not STASIS_APP:
+        errors.append("STASIS_APP is not set")
+    else:
+        log.info(f"[ARI-CONFIG] ✓ STASIS_APP: {STASIS_APP}")
+    
+    if not ASTERISK_IP:
+        errors.append("ASTERISK_IP is not set")
+    else:
+        log.info(f"[ARI-CONFIG] ✓ ASTERISK_IP: {ASTERISK_IP}")
+    
+    if not MY_PC_IP:
+        errors.append("MY_PC_IP is not set")
+    else:
+        log.info(f"[ARI-CONFIG] ✓ MY_PC_IP: {MY_PC_IP}")
+    
+    # Check RTP port range
+    if RTP_START_PORT >= RTP_END_PORT:
+        errors.append(f"Invalid RTP port range: {RTP_START_PORT}-{RTP_END_PORT}")
+    else:
+        log.info(f"[ARI-CONFIG] ✓ RTP port range: {RTP_START_PORT}-{RTP_END_PORT}")
+    
+    if errors:
+        log.error("[ARI-CONFIG] ❌ Configuration validation FAILED:")
+        for error in errors:
+            log.error(f"[ARI-CONFIG]    - {error}")
+        return False
+    else:
+        log.info("[ARI-CONFIG] ✅ All ARI configuration variables validated successfully")
+        return True
+
 async def init_ari_session():
     """Initialize the ARI HTTP session"""
     global _ari_session, _port_lock
     try:
+        # Validate configuration first
+        if not _validate_ari_config():
+            raise RuntimeError("ARI configuration validation failed")
+        
         _ari_session = aiohttp.ClientSession()
         _port_lock = asyncio.Lock()
-        log.info(f"[ARI] HTTP Session initialized: {ARI_URL}")
+        log.info(f"[ARI] ✅ HTTP Session initialized: {ARI_URL}")
+        log.info(f"[ARI]    Auth: {ARI_USER}@{ASTERISK_IP}:8088")
+        log.info(f"[ARI]    Stasis App: {STASIS_APP}")
+        log.info(f"[ARI]    Ready for bridge/ExternalMedia operations")
         return _ari_session
     except Exception as e:
-        log.error(f"[ARI] HTTP Session initialization failed: {e}")
+        log.error(f"[ARI] ❌ HTTP Session initialization failed: {e}")
         raise
 
 async def close_ari_session():
@@ -88,10 +150,23 @@ async def close_ari_session():
 
 async def ari_request(method: str, path: str, payload: Optional[Dict] = None,
                        params: Optional[Dict] = None) -> Dict[str, Any]:
-    """Make an ARI API request"""
-    if not _ari_session:
-        log.error("[ARI] HTTP Session not initialized")
-        return {}
+    """
+    Make an ARI API request with automatic lazy initialization
+    
+    If the session is None or closed, automatically reinitialize it.
+    This handles race conditions and ensures resilience.
+    """
+    global _ari_session
+    
+    # Check if session is None or closed, and auto-reinitialize if needed
+    if not _ari_session or _ari_session.closed:
+        log.warning("[ARI] HTTP Session not initialized or closed - attempting lazy re-initialization...")
+        try:
+            await init_ari_session()
+            log.info("[ARI] ✓ HTTP Session re-initialized successfully")
+        except Exception as e:
+            log.error(f"[ARI] ✗ Failed to lazy re-initialize HTTP Session: {e}")
+            return {}
 
     try:
         url = f"{ARI_URL}{path}"
@@ -547,17 +622,32 @@ async def create_bridge(bridge_type: str = "mixing") -> Optional[str]:
             "name": f"ai-bridge-{int(time.time() * 1000)}"
         }
 
+        log.info(f"[ARI-BRIDGE] Creating {bridge_type} bridge: {bridge_data['name']}")
+        log.debug(f"[ARI-BRIDGE] ARI endpoint: POST {ARI_URL}/ari/bridges")
+        log.debug(f"[ARI-BRIDGE] Auth: {ARI_USER}@{ARI_URL}")
+
         response = await ari_request("POST", "/ari/bridges", payload=bridge_data)
 
         if response and "id" in response:
             bridge_id = response["id"]
-            log.info(f"[ARI-BRIDGE] ✅ Created mixing bridge: {bridge_id}")
+            log.info(f"[ARI-BRIDGE] ✅ Successfully created bridge: {bridge_id}")
+            log.info(f"[ARI-BRIDGE]    Type: {bridge_type}")
+            log.info(f"[ARI-BRIDGE]    Name: {bridge_data['name']}")
             return bridge_id
         else:
-            log.error(f"[ARI-BRIDGE] ❌ Failed to create bridge: {response}")
+            log.error(f"[ARI-BRIDGE] ❌ Failed to create bridge: {bridge_type}")
+            log.error(f"[ARI-BRIDGE] Response: {response}")
+            log.error(f"[ARI-BRIDGE] Expected response to contain 'id' field")
+            if isinstance(response, dict):
+                log.error(f"[ARI-BRIDGE] Response keys: {response.keys()}")
+                if "message" in response:
+                    log.error(f"[ARI-BRIDGE] Error message: {response.get('message')}")
             return None
     except Exception as e:
         log.error(f"[ARI-BRIDGE] ❌ Bridge creation exception: {e}")
+        log.error(f"[ARI-BRIDGE] Exception type: {type(e).__name__}")
+        import traceback
+        log.error(f"[ARI-BRIDGE] Traceback: {traceback.format_exc()}")
         return None
 
 async def add_channel_to_bridge(bridge_id: str, channel_id: str, role: str = "participant") -> bool:
@@ -604,24 +694,45 @@ async def create_external_media(call_id: str, formats: str = "ulaw", rtp_ip: str
         ExternalMedia response with channel_id, or None if failed
     """
     try:
+        external_host = f"{rtp_ip}:{rtp_port}" if rtp_port else f"{rtp_ip}:0"
         external_media_data = {
             "app": STASIS_APP,
-            "external_host": f"{rtp_ip}:{rtp_port}" if rtp_port else f"{rtp_ip}:0",
+            "external_host": external_host,
             "format": formats,
             "channelId": f"external-{call_id}"
         }
+
+        log.info(f"[ARI-EXTERNAL-MEDIA] Creating ExternalMedia channel for call: {call_id}")
+        log.info(f"[ARI-EXTERNAL-MEDIA]    Format: {formats}")
+        log.info(f"[ARI-EXTERNAL-MEDIA]    External Host: {external_host}")
+        log.info(f"[ARI-EXTERNAL-MEDIA]    Channel ID: {external_media_data['channelId']}")
+        log.info(f"[ARI-EXTERNAL-MEDIA]    Stasis App: {STASIS_APP}")
+        log.debug(f"[ARI-EXTERNAL-MEDIA] ARI endpoint: POST {ARI_URL}/ari/channels/externalMedia")
+        log.debug(f"[ARI-EXTERNAL-MEDIA] Payload: {external_media_data}")
 
         response = await ari_request("POST", "/ari/channels/externalMedia", payload=external_media_data)
 
         if response and "id" in response:
             channel_id = response["id"]
-            log.info(f"[ARI-EXTERNAL-MEDIA] ✅ Created ExternalMedia channel: {channel_id}")
+            log.info(f"[ARI-EXTERNAL-MEDIA] ✅ Successfully created ExternalMedia channel: {channel_id}")
+            log.info(f"[ARI-EXTERNAL-MEDIA]    For Call: {call_id}")
+            log.info(f"[ARI-EXTERNAL-MEDIA]    RTP Endpoint: {external_host}")
+            log.debug(f"[ARI-EXTERNAL-MEDIA]    Full Response: {response}")
             return response
         else:
-            log.error(f"[ARI-EXTERNAL-MEDIA] ❌ Failed to create ExternalMedia: {response}")
+            log.error(f"[ARI-EXTERNAL-MEDIA] ❌ Failed to create ExternalMedia channel for {call_id}")
+            log.error(f"[ARI-EXTERNAL-MEDIA] Response: {response}")
+            log.error(f"[ARI-EXTERNAL-MEDIA] Expected response to contain 'id' field")
+            if isinstance(response, dict):
+                log.error(f"[ARI-EXTERNAL-MEDIA] Response keys: {response.keys()}")
+                if "message" in response:
+                    log.error(f"[ARI-EXTERNAL-MEDIA] Error message: {response.get('message')}")
             return None
     except Exception as e:
-        log.error(f"[ARI-EXTERNAL-MEDIA] ❌ ExternalMedia creation exception: {e}")
+        log.error(f"[ARI-EXTERNAL-MEDIA] ❌ ExternalMedia creation exception for {call_id}: {e}")
+        log.error(f"[ARI-EXTERNAL-MEDIA] Exception type: {type(e).__name__}")
+        import traceback
+        log.error(f"[ARI-EXTERNAL-MEDIA] Traceback: {traceback.format_exc()}")
         return None
 
 async def allocate_rtp_port() -> Optional[int]:

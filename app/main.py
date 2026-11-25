@@ -157,7 +157,15 @@ async def lifespan(app: FastAPI):
             log.error(f"[STARTUP] ✗ Media service initialization failed: {e}")
             raise RuntimeError(f"Media service failed to initialize: {e}")
 
-        # Initialize ARI connection
+        # Initialize ARI HTTP session (CRITICAL: must be before WebSocket)
+        try:
+            await init_ari_session()
+            log.info("[STARTUP] ✓ ARI HTTP session initialized for bridge/ExternalMedia operations")
+        except Exception as e:
+            log.error(f"[STARTUP] ✗ ARI HTTP session initialization failed: {e}")
+            raise RuntimeError(f"ARI HTTP session initialization failed: {e}")
+
+        # Initialize ARI WebSocket connection
         try:
             from app.transport.asterisk import init_ari_websocket, register_event_handler
             from app.handlers.ari_event_handler import (
@@ -169,7 +177,7 @@ async def lifespan(app: FastAPI):
                 register_event_handler("StasisStart", handle_stasis_start)
                 register_event_handler("StasisEnd", handle_stasis_end)
                 register_event_handler("ChannelDtmfReceived", handle_channel_dtmf_received)
-                log.info("[STARTUP] ✓ ARI WebSocket connected")
+                log.info("[STARTUP] ✓ ARI WebSocket connected and listening for Stasis events")
             else:
                 log.error("[STARTUP] ✗ ARI WebSocket connection failed")
         except Exception as e:
