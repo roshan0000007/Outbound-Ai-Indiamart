@@ -318,9 +318,9 @@ async def handle_channel_dtmf_received(event: Dict[str, Any]) -> bool:
     Handle DTMF digit received during call
     
     Flow:
-    - After language prompt is played, caller presses 1 (English) or 2 (Hindi)
-    - Language is set, Gemini session unblocked
-    - Language-specific greeting is then sent by Gemini Live
+    - Press 1: English
+    - Press 2: Hindi
+    - Language selection triggers greeting playback and conversation flow
     
     Args:
         event: ARI ChannelDtmfReceived event
@@ -360,8 +360,7 @@ async def handle_channel_dtmf_received(event: Dict[str, Any]) -> bool:
             log.warning(f"[DTMF] Invalid DTMF digit: {digit} (expected 1 or 2)")
             return False
 
-        language_name = "English" if selected_language == "en" else "Hindi"
-        log.info(f"[DTMF] 🎯 Language selected: {digit} → {selected_language} ({language_name}) for {call_id}")
+        log.info(f"[DTMF] 🎯 Language selected: {digit} → {selected_language} for {call_id}")
 
         # Save language selection to state
         from ..core.redis import set_session as redis_set_session
@@ -370,7 +369,6 @@ async def handle_channel_dtmf_received(event: Dict[str, Any]) -> bool:
                 "call_id": call_id,
                 "language": selected_language,
                 "digit_pressed": digit,
-                "language_name": language_name,
                 "selected_at": datetime.utcnow().isoformat()
             }
             await redis_set_session(
@@ -378,7 +376,7 @@ async def handle_channel_dtmf_received(event: Dict[str, Any]) -> bool:
                 language_state,
                 ttl=3600  # Keep for 1 hour
             )
-            log.info(f"[DTMF] ✅ Language state saved: {language_name}")
+            log.info(f"[DTMF] ✅ Language state saved: {selected_language}")
         except Exception as e:
             log.error(f"[DTMF] Error saving language state: {e}")
             return False
@@ -392,7 +390,7 @@ async def handle_channel_dtmf_received(event: Dict[str, Any]) -> bool:
                 if session:
                     session["language"] = selected_language
                     await session_mgr.update_session(call_id, session)
-                    log.info(f"[DTMF] ✅ Call session language updated: {language_name}")
+                    log.info(f"[DTMF] ✅ Call session updated with language: {selected_language}")
         except Exception as e:
             log.warning(f"[DTMF] Error updating session language: {e}")
 
@@ -403,8 +401,7 @@ async def handle_channel_dtmf_received(event: Dict[str, Any]) -> bool:
             gemini_session = await get_gemini_audio_session(call_id)
             if gemini_session:
                 gemini_session.set_call_language(selected_language)
-                log.info(f"[DTMF] ✅ Gemini session language set: {language_name}")
-                log.info(f"[DTMF] 📞 Gemini will now send {language_name} greeting and ask questions")
+                log.info(f"[DTMF] ✅ Gemini session language set: {selected_language}")
             else:
                 log.warning(f"[DTMF] ⚠️ Gemini audio session not found, but continuing...")
         except Exception as e:
@@ -421,10 +418,10 @@ async def handle_channel_dtmf_received(event: Dict[str, Any]) -> bool:
 
         log.info(f"[DTMF] ✅✅✅ LANGUAGE SELECTION COMPLETE")
         log.info(f"[DTMF]    ├─ Call ID: {call_id}")
-        log.info(f"[DTMF]    ├─ Language: {language_name}")
-        log.info(f"[DTMF]    ├─ DTMF Digit Pressed: {digit}")
-        log.info(f"[DTMF]    ├─ Gemini session unblocked")
-        log.info(f"[DTMF]    └─ Waiting for Gemini to send {language_name} greeting...")
+        log.info(f"[DTMF]    ├─ Language: {selected_language}")
+        log.info(f"[DTMF]    ├─ DTMF Digit: {digit}")
+        log.info(f"[DTMF]    ├─ Gemini session released to start conversation")
+        log.info(f"[DTMF]    └─ Ready for greeting and conversation flow")
 
         return True
 
