@@ -20,60 +20,62 @@ from ..services.gemini_audio_pipeline import get_gemini_audio_session
 
 def _generate_dtmf_prompt_audio() -> bytes:
     """
-    Generate simple 8kHz mu-law audio prompt: "Press 1 for English, Press 2 for Hindi"
-    If TTS is not available, returns a beep sequence as fallback
+    Generate 8kHz mu-law audio prompt using Google Cloud TTS or cached audio
+    Message: "Namaste! Thank you for calling. For English, press 1. Hindi mein baat karne ke liye, 2 dabayein."
+    
+    This bilingual message is played immediately after call arrival, before Gemini starts.
     """
     try:
-        # Try to use Google TTS if available
-        import threading
+        # Try to use Google Cloud TTS
         from google.cloud import texttospeech
+        import os
         
-        client = texttospeech.TextToSpeechClient()
-        synthesis_input = texttospeech.SynthesisInput(
-            text="Press 1 for English. Press 2 for Hindi."
-        )
-        voice = texttospeech.VoiceSelectionParams(
-            language_code="en-US",
-            ssml_gender=texttospeech.SsmlVoiceGender.NEUTRAL
-        )
-        audio_config = texttospeech.AudioConfig(
-            audio_encoding=texttospeech.AudioEncoding.LINEAR16,
-            sample_rate_hertz=8000
-        )
-        
-        response = client.synthesize_speech(
-            input=synthesis_input, voice=voice, audio_config=audio_config
-        )
-        
-        # Convert LINEAR16 to mu-law using audioop
-        import audioop
-        return audioop.lin2ulaw(response.audio_content, 2)
+        # Set credentials if available
+        if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+            client = texttospeech.TextToSpeechClient()
+            
+            # Use bilingual message for natural greeting + language selection
+            prompt_text = "Namaste! Thank you for calling. For English, press 1. Hindi mein baat karne ke liye, 2 dabayein."
+            
+            synthesis_input = texttospeech.SynthesisInput(text=prompt_text)
+            voice = texttospeech.VoiceSelectionParams(
+                language_code="en-IN",  # Indian English
+                ssml_gender=texttospeech.SsmlVoiceGender.NEUTRAL,
+                name="en-IN-Standard-B"  # Indian voice
+            )
+            audio_config = texttospeech.AudioConfig(
+                audio_encoding=texttospeech.AudioEncoding.LINEAR16,
+                sample_rate_hertz=8000
+            )
+            
+            response = client.synthesize_speech(
+                input=synthesis_input, voice=voice, audio_config=audio_config
+            )
+            
+            # Convert LINEAR16 to mu-law using audioop
+            import audioop
+            mulaw_audio = audioop.lin2ulaw(response.audio_content, 2)
+            log.info(f"[Greeting] 🎤 Generated TTS prompt audio: {len(mulaw_audio)} bytes")
+            return mulaw_audio
+            
     except Exception as e:
-        log.debug(f"[Greeting] TTS unavailable, using fallback beep sequence: {e}")
-        
-        # Fallback: Generate simple beep sequence (1000Hz tone, 200ms, repeated)
-        # This is a placeholder; in production, use a pre-recorded file
-        sample_rate = 8000
-        duration_ms = 1000
-        frequency = 1000
-        
-        samples = []
-        num_samples = int(sample_rate * duration_ms / 1000)
-        for i in range(num_samples):
-            # Generate sine wave
-            angle = 2.0 * 3.14159 * frequency * i / sample_rate
-            sample = int(32767 * 0.5 * (1 + __import__('math').sin(angle)))
-            samples.append(sample)
-        
-        # Convert to bytes and then to mu-law
-        audio_bytes = struct.pack('<' + 'h' * len(samples), *samples)
-        import audioop
-        try:
-            return audioop.lin2ulaw(audio_bytes, 2)
-        except:
-            # Last resort: return silence
-            log.warning("[Greeting] Could not generate audio prompt")
-            return b'\xff' * (sample_rate * duration_ms // 1000)
+        log.debug(f"[Greeting] Google TTS unavailable: {e}")
+    
+    # Fallback: Try to load from pre-recorded file
+    try:
+        import os
+        prompt_file = "/var/lib/asterisk/sounds/custom/lang_prompt_bilingual.ulaw"
+        if os.path.exists(prompt_file):
+            with open(prompt_file, 'rb') as f:
+                audio_data = f.read()
+            log.info(f"[Greeting] 🔊 Loaded pre-recorded prompt: {len(audio_data)} bytes")
+            return audio_data
+    except Exception as e:
+        log.debug(f"[Greeting] Could not load pre-recorded prompt: {e}")
+    
+    # Last resort fallback: Return silence (caller can still press DTMF)
+    log.warning("[Greeting] ⚠️ Could not generate or load audio prompt - will play silence (DTMF still works)")
+    return b'\xff' * 8000  # 1 second of silence at 8kHz
 
 
 class GreetingService:
@@ -85,15 +87,18 @@ class GreetingService:
 
     async def play_language_selection_prompt_via_rtp(self, call_id: str) -> bool:
         """
-        🔧 CRITICAL: Play language selection prompt via RTP audio (not Asterisk playback)
+        🔧 CRITICAL: Play bilingual language selection prompt via RTP audio
+        Message: "Namaste! Thank you for calling. For English, press 1. Hindi mein baat karne ke liye, 2 dabayein."
+        
         This ensures the caller ALWAYS hears the prompt, even if Asterisk sounds are missing.
         
         Flow:
         1. Get media session for this call
         2. Generate or load language prompt audio (mu-law, 8kHz)
         3. Send directly via media TX queue
-        4. Caller hears "Press 1 for English, 2 for Hindi"
+        4. Caller hears "Namaste! Thank you for calling. For English, press 1. Hindi mein baat karne ke liye, 2 dabayein."
         5. DTMF gating ensures Gemini doesn't start until digit received
+        6. After DTMF, language-specific greeting is played by Gemini
         
         Args:
             call_id: Call ID
@@ -102,7 +107,8 @@ class GreetingService:
             True if prompt was sent successfully
         """
         try:
-            log.info(f"[Greeting] 📢 Playing language selection prompt via RTP for {call_id}")
+            log.info(f"[Greeting] 📢 Playing bilingual language selection prompt via RTP for {call_id}")
+            log.info(f"[Greeting]    Message: 'Namaste! Thank you for calling. For English, press 1. Hindi mein baat karne ke liye, 2 dabayein.'")
             
             # Get media session
             from ..services.media_service import get_media_service
@@ -116,36 +122,41 @@ class GreetingService:
                 log.error(f"[Greeting] Media session not found for {call_id}")
                 return False
             
-            # Generate language prompt audio
-            log.info("[Greeting] Generating DTMF prompt audio...")
+            # Generate language prompt audio (bilingual TTS or cached)
+            log.info("[Greeting] Generating/loading bilingual DTMF prompt audio...")
             prompt_audio = _generate_dtmf_prompt_audio()
             
             if not prompt_audio:
                 log.warning("[Greeting] Failed to generate prompt audio")
                 return False
             
-            log.info(f"[Greeting] ✅ Prompt audio generated: {len(prompt_audio)} bytes")
+            log.info(f"[Greeting] ✅ Prompt audio ready: {len(prompt_audio)} bytes (~{len(prompt_audio)//8}ms at 8kHz mu-law)")
             
             # Send via RTP (this ensures it plays to the caller)
             # Use low-level queue directly for immediate delivery
             try:
                 # Queue audio in 160-byte frames (20ms at 8kHz mu-law)
                 frame_size = 160
+                frames_sent = 0
                 for i in range(0, len(prompt_audio), frame_size):
                     frame = prompt_audio[i:i+frame_size]
                     if len(frame) < frame_size:
-                        frame = frame + b'\xff' * (frame_size - len(frame))
+                        frame = frame + b'\xff' * (frame_size - len(frame))  # Pad with silence
                     
                     try:
                         media_session.tx_queue.put_nowait(frame)
+                        frames_sent += 1
                     except asyncio.QueueFull:
-                        log.warning(f"[Greeting] TX queue full, dropping frame")
+                        log.warning(f"[Greeting] TX queue full at frame {frames_sent}, dropping remaining")
+                        break
                 
-                log.info(f"[Greeting] ✅ Prompt audio queued to RTP TX: {len(prompt_audio)} bytes")
+                log.info(f"[Greeting] ✅ Bilingual prompt queued to RTP TX: {frames_sent} frames (~{frames_sent*20}ms)")
+                log.info(f"[Greeting] ⏳ Waiting for caller to press 1 (English) or 2 (Hindi)...")
                 
-                # Give time for audio to be transmitted
-                await asyncio.sleep(1.5)
+                # Give time for audio to be transmitted (typically 2-3 seconds for TTS)
+                await asyncio.sleep(3.0)
                 
+                log.info(f"[Greeting] ✅ Language selection prompt complete - DTMF waiting active")
                 return True
                 
             except Exception as e:
@@ -319,7 +330,9 @@ async def init_greeting_service():
     """Initialize greeting service"""
     global _service
     _service = GreetingService()
-    log.info("[Greeting] Greeting service initialized")
+    log.info("[Greeting] ✅ Greeting service initialized")
+    log.info("[Greeting] 📢 Language Selection Prompt:")
+    log.info("[Greeting]    'Namaste! Thank you for calling. For English, press 1. Hindi mein baat karne ke liye, 2 dabayein.'")
     return _service
 
 
