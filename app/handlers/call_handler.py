@@ -63,10 +63,19 @@ class CallHandler:
                 
                 media_service = get_media_service()
                 if media_service:
+                    # Create proper MediaConfig with all required fields
                     media_config = MediaConfig(
                         call_id=call_id,
-                        rtp_ip="0.0.0.0",
-                        rtp_port=0  # Let service allocate
+                        channel_id=call_id,
+                        external_media_id=call_id,
+                        bridge_id=call_id,
+                        user_id=user_id,
+                        campaign_id=0,
+                        dnid=dnid,
+                        language="en",
+                        codec=0,
+                        sample_rate=8000,
+                        frame_size=160
                     )
                     
                     media_session = await media_service.create_session(media_config)
