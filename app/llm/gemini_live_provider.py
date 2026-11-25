@@ -11,6 +11,7 @@ a reply is recorded, and Gemini answers it after the current reply finishes.
 """
 
 import os
+import array
 import asyncio
 import audioop
 from typing import Optional, Dict, Any, Callable, AsyncIterator
@@ -25,43 +26,45 @@ INPUT_MIME = "audio/pcm;rate=16000"
 class OutboundResampler:
     """
     Converts Gemini's 24 kHz 16-bit PCM into 8 kHz mu-law for RTP.
-    Keeps resampler state and buffers about 100 ms before converting.
+
+    Uses a 3-sample average before each decimation step (24 kHz -> 8 kHz is exactly 3:1).
+    This reduces aliasing, the main cause of a metallic, robotic sound.
     Create one instance per call.
     """
 
-    SRC_RATE = 24000
-    DST_RATE = 8000
-    MIN_BYTES = SRC_RATE * 2 // 10  # 100 ms of 16-bit mono at 24 kHz
+    MIN_SAMPLES = 2400  # 100 ms at 24 kHz
 
     def __init__(self):
-        self._buf = bytearray()
-        self._state = None
+        self._pending = array.array("h")
 
     def push(self, pcm24k: bytes) -> bytes:
-        self._buf.extend(pcm24k)
-        if len(self._buf) < self.MIN_BYTES:
+        usable = pcm24k[: len(pcm24k) // 2 * 2]  # whole 16-bit samples only
+        samples = array.array("h")
+        samples.frombytes(usable)
+        self._pending.extend(samples)
+        if len(self._pending) < self.MIN_SAMPLES:
             return b""
-        return self._convert(self._take())
+        return self._emit(final=False)
 
     def flush(self) -> bytes:
-        if not self._buf:
+        if not self._pending:
             return b""
-        return self._convert(self._take())
+        return self._emit(final=True)
 
-    def _take(self) -> bytes:
-        chunk = bytes(self._buf)
-        self._buf.clear()
-        if len(chunk) % 2:  # keep whole 16-bit samples only
-            chunk = chunk[:-1]
-        return chunk
+    def reset(self) -> None:
+        """Drop buffered audio, used on barge-in."""
+        self._pending = array.array("h")
 
-    def _convert(self, pcm24k: bytes) -> bytes:
-        if not pcm24k:
+    def _emit(self, final: bool) -> bytes:
+        if final and len(self._pending) % 3:
+            self._pending.extend([0] * (3 - len(self._pending) % 3))
+        n = len(self._pending) // 3 * 3
+        if n == 0:
             return b""
-        pcm8k, self._state = audioop.ratecv(
-            pcm24k, 2, 1, self.SRC_RATE, self.DST_RATE, self._state
-        )
-        return audioop.lin2ulaw(pcm8k, 2)
+        block = self._pending[:n]
+        del self._pending[:n]
+        out = array.array("h", [sum(block[i:i + 3]) // 3 for i in range(0, n, 3)])
+        return audioop.lin2ulaw(out.tobytes(), 2)
 
 
 def _build_realtime_input_config(types):
@@ -85,7 +88,7 @@ class GeminiLiveProvider:
         self.api_key = os.getenv("GEMINI_API_KEY", "")
         self.model = os.getenv("GEMINI_LIVE_MODEL", "gemini-2.0-flash-live-001")
         self.text_model = os.getenv("GEMINI_TEXT_MODEL", "gemini-2.5-flash")
-        self.voice = os.getenv("GEMINI_VOICE", "Aoede")
+        self.voice = os.getenv("GEMINI_VOICE", "Kore")
         self.temperature = float(os.getenv("LLM_TEMPERATURE", "0.3"))
         self.max_tokens = int(os.getenv("LLM_MAX_TOKENS", "500"))
 
@@ -206,12 +209,16 @@ class GeminiLiveProvider:
                 log.info(f"[Gemini Live] WebSocket connected: {self.session_id}")
 
                 if greeting_text:
+                    # Sent as an instruction, so the model greets naturally instead of
+                    # reading the text word for word.
                     await live.send_client_content(
                         turns=types.Content(
                             role="user",
                             parts=[types.Part(text=(
-                                "The call has connected. Say this greeting once, exactly as written, "
-                                "then wait for the customer to reply: " + greeting_text
+                                "The call has connected. Greet the customer once, warmly and naturally, "
+                                "in your own words, keeping the same meaning as this greeting: "
+                                + greeting_text
+                                + " Then wait for the customer to reply."
                             ))],
                         ),
                         turn_complete=True,
