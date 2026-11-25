@@ -1,0 +1,209 @@
+# ============================================================
+# AI AGENT - DEVELOPMENT REQUIREMENTS
+# Includes all production dependencies + development tools
+# Python 3.11+
+# ============================================================
+
+# Include all production requirements
+-r requirements.txt
+
+# ============================================================
+# TESTING & TEST COVERAGE
+# ============================================================
+pytest==7.4.3
+pytest-asyncio==0.21.1
+pytest-cov==4.1.0
+coverage==7.15.4
+hypothesis==6.165.10
+
+# ============================================================
+# CODE QUALITY & LINTING
+# ============================================================
+flake8==7.3.0
+pylint==4.0.7
+isort==8.0.1
+mccabe==0.7.0
+pycodestyle==2.14.0
+pyflakes==3.4.0
+astroid==4.0.4
+
+# ============================================================
+# CODE FORMATTING & STYLE
+# ============================================================
+black==24.10.0
+autopep8==2.0.0
+
+# ============================================================
+# TYPE CHECKING
+# ============================================================
+mypy==1.13.0
+
+# ============================================================
+# DOCUMENTATION
+# ============================================================
+sphinx==8.0.2
+sphinx-rtd-theme==2.0.0
+sphinx-autodoc-typehints==2.0.0
+
+# ============================================================
+# DEBUGGING & PROFILING
+# ============================================================
+ipython==8.32.0
+ipdb==0.13.13
+pdb-plus==1.3
+
+# ============================================================
+# PERFORMANCE PROFILING
+# ============================================================
+memory-profiler==0.61.0
+line-profiler==4.1.1
+
+# ============================================================
+# SECURITY SCANNING
+# ============================================================
+bandit==1.8.0
+safety==3.2.15
+
+# ============================================================
+# DEVELOPMENT UTILITIES
+# ============================================================
+pre-commit==4.0.1
+bump2version==1.0.1
+wheel==0.45.1
+twine==6.1.0
+build==1.5.0
+setuptools==75.6.0
+
+# ============================================================
+# INTERACTIVE DEVELOPMENT
+# ============================================================
+jupyter==1.0.0
+jupyterlab==4.2.7
+notebook==7.2.2
+
+# ============================================================
+# ENVIRONMENT MANAGEMENT
+# ============================================================
+virtualenv==20.28.1
+direnv==2.4.0
+
+# ============================================================
+# GIT & VERSION CONTROL
+# ============================================================
+GitPython==3.1.46
+pygit2==1.16.1
+
+# ============================================================
+# API DOCUMENTATION & TESTING
+# ============================================================
+httpie==3.1.0
+
+# ============================================================
+# DATABASE TOOLS
+# ============================================================
+alembic==1.14.2
+sqlparse==0.5.1
+
+# ============================================================
+# ENVIRONMENT & CLI TOOLS
+# ============================================================
+invoke==2.2.0
+fabric==3.2.2
+
+# ============================================================
+# LOGGING & MONITORING (Extended)
+# ============================================================
+python-json-logger==3.2.1
+loguru==0.7.2
+
+# ============================================================
+# OPTIONAL DEVELOPMENT PACKAGES
+# ============================================================
+# Uncomment as needed for specific development tasks
+
+# API Client for testing:
+# restclient==3.0.0
+
+# Advanced debugging:
+# pudb==2024.1
+# wdb==3.11.1
+
+# Data validation testing:
+# faker==27.6.1
+# factory-boy==3.3.1
+
+# Performance testing:
+# locust==3.0.0
+# vegeta==12.9.1
+
+# Documentation generation:
+# pdoc==14.11.0
+
+# Code complexity analysis:
+# radon==7.4.0
+
+# ============================================================
+# INSTALLATION INSTRUCTIONS FOR DEVELOPMENT
+# ============================================================
+#
+# 1. Create a virtual environment:
+#    python -m venv venv
+#
+# 2. Activate the virtual environment:
+#    On Windows:
+#      venv\Scripts\activate
+#    On Linux/Mac:
+#      source venv/bin/activate
+#
+# 3. Install development dependencies:
+#    pip install -r requirements-dev.txt
+#
+# 4. Install pre-commit hooks (optional):
+#    pre-commit install
+#
+# 5. Run tests:
+#    pytest tests/ -v --cov=app
+#
+# 6. Run linting:
+#    flake8 app/ --max-line-length=120
+#    pylint app/
+#    black --check app/
+#    isort --check-only app/
+#
+# 7. Run type checking:
+#    mypy app/
+#
+# 8. Format code:
+#    black app/
+#    isort app/
+#
+# 9. Build documentation:
+#    cd docs && make html
+#
+# 10. Run security scan:
+#     bandit -r app/
+#     safety check
+#
+# ============================================================
+# DEVELOPMENT WORKFLOW QUICK COMMANDS
+# ============================================================
+#
+# Format and lint code:
+#    black app/ && isort app/ && flake8 app/
+#
+# Run all quality checks:
+#    pytest --cov=app && mypy app/ && pylint app/
+#
+# Interactive development:
+#    jupyter lab
+#
+# Debug a specific test:
+#    pytest tests/test_module.py -v --pdb
+#
+# Profile code performance:
+#    python -m cProfile -o output.prof app/main.py
+#
+# Analyze profiling results:
+#    import pstats; p = pstats.Stats('output.prof'); p.sort_stats('cumulative').print_stats(10)
+#
+# ============================================================
