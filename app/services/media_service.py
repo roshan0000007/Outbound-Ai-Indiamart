@@ -1260,7 +1260,8 @@ class MediaSession:
                         response_audio = await gemini_session.get_response_audio()
                         
                         if response_audio and len(response_audio) > 0:
-                            # Queue for RTP transmission
+                            # ✅ FIX #3: Queue Gemini response audio for RTP transmission
+                            # This ensures response audio → TX queue → RTP → Caller
                             try:
                                 self.tx_queue.put_nowait(response_audio)
                                 frame_count += 1
@@ -1268,31 +1269,36 @@ class MediaSession:
                                 if on_response_audio:
                                     on_response_audio(response_audio)
                                 
-                                if frame_count % 100 == 0:
-                                    log.debug(f"[MEDIA-SESSION] Sent {frame_count} Gemini response frames via RTP")
+                                if frame_count % 20 == 0:
+                                    log.info(f"[MEDIA-SESSION] ✅ Queued {frame_count} Gemini response frames to TX (audio flowing to caller)")
                                     
                             except asyncio.QueueFull:
-                                log.warning(f"[MEDIA-SESSION] TX queue full, dropping frame")
+                                log.warning(f"[MEDIA-SESSION] TX queue full, dropping response frame")
                         
                         await asyncio.sleep(0.001)
 
                 except Exception as e:
                     log.error(f"[MEDIA-SESSION] Error reading Gemini response: {e}")
 
-            # Start Gemini processing
+            # Create task to process Gemini stream and handle responses
             async def process_gemini_stream():
                 """Start Gemini bidirectional streaming"""
                 try:
+                    # ✅ FIX #1: Get greeting to send as first message
+                    from ..core.client_config import ClientConfig
+                    greeting_text = ClientConfig.get_greeting()
+                    
                     success = await gemini_session.process_audio_stream(
                         on_response_audio=on_response_audio,
-                        on_response_text=on_response_text
+                        on_response_text=on_response_text,
+                        greeting_text=greeting_text
                     )
                     if success:
                         log.info(f"[MEDIA-SESSION] ✅ Gemini stream processing completed")
                     else:
-                        log.error(f"[MEDIA-SESSION] Gemini stream processing failed")
+                        log.warning(f"[MEDIA-SESSION] Gemini stream processing returned False")
                 except Exception as e:
-                    log.error(f"[MEDIA-SESSION] Error in Gemini processing: {e}")
+                    log.error(f"[MEDIA-SESSION] Error in Gemini processing: {e}", exc_info=True)
 
             # Run all tasks concurrently
             try:

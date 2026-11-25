@@ -132,14 +132,18 @@ class GeminiAudioSession:
     async def process_audio_stream(
         self,
         on_response_audio: Optional[Callable[[bytes], None]] = None,
-        on_response_text: Optional[Callable[[str], None]] = None
+        on_response_text: Optional[Callable[[str], None]] = None,
+        greeting_text: Optional[str] = None
     ) -> bool:
         """
         Start processing audio through Gemini Live
         
+        ✅ FIX: Pass greeting_text so it's sent as first message
+        
         Args:
             on_response_audio: Callback for each response audio chunk
             on_response_text: Callback for response text transcriptions
+            greeting_text: Optional greeting to send as first message
             
         Returns:
             bool: Success status
@@ -150,6 +154,9 @@ class GeminiAudioSession:
                 return False
 
             log.info(f"[Gemini Audio] Starting audio stream processing for call {self.call_id}")
+            if greeting_text:
+                log.info(f"[Gemini Audio]    ├─ Greeting: '{greeting_text[:60]}...'")
+                log.info(f"[Gemini Audio]    └─ Will be sent as first message to Gemini Live")
 
             # Create audio input generator
             audio_gen = self.audio_input_generator()
@@ -165,7 +172,8 @@ class GeminiAudioSession:
             response_audio = await self.gemini_provider.stream_audio_bidirectional(
                 audio_input_stream=audio_gen,
                 on_audio_chunk=queue_response_audio,
-                on_text_chunk=on_response_text
+                on_text_chunk=on_response_text,
+                greeting_text=greeting_text
             )
 
             if response_audio:
