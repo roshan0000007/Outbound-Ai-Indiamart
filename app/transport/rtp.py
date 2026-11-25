@@ -2,9 +2,9 @@
 RTP (Real-time Transport Protocol) Handler
 Manages RTP audio streaming and packet processing
 
-CRITICAL AUDIO CODEC CONVERSIONS:
-1. WAV (from TTS) → PCM (raw samples) → ULAW (for RTP transmission)
-2. ULAW (received RTP) → PCM (for STT/processing) 
+Audio codec conversions are handled by Gemini Live directly:
+- Incoming RTP: 8kHz PCM/µLaw
+- Outgoing RTP: 8kHz PCM/µLaw
 """
 
 import asyncio
@@ -27,27 +27,14 @@ def wav_bytes_to_pcm(wav_bytes: bytes) -> Optional[bytes]:
     """
     Convert WAV file bytes to raw PCM samples (16-bit signed)
     
-    ✅ TASK 3 FIX: Validate sample rate and detect 16kHz → 8kHz resampling needs
-    
-    Input: Complete WAV file (from Sarvam TTS API)
+    Input: Complete WAV file
     Output: Raw PCM audio samples (16-bit signed, little-endian)
     
-    CRITICAL FIX #1: Sarvam TTS returns base64-encoded WAV file
-    This function:
-    1. Reads WAV header (sample rate, channels, bit depth)
-    2. Validates format: mono (1 channel), 16-bit, 8kHz or 16kHz
-    3. Extracts audio data chunk
-    4. Logs sample rate for diagnostics (16kHz triggers resampling warning)
-    5. Returns raw PCM samples or None on parse error
-    6. Logs detailed parsing information at DEBUG level
-    
     Args:
-        wav_bytes: Complete WAV file bytes (audio data from TTS)
+        wav_bytes: Complete WAV file bytes
         
     Returns:
         Raw PCM audio bytes (16-bit signed) or None on error
-        
-    Validates: Requirements 8.1, 8.2, Task 3
     """
     try:
         if not wav_bytes or len(wav_bytes) < 44:
@@ -203,13 +190,7 @@ def ulaw_to_linear(ulaw_bytes: bytes) -> bytes:
     """
     Convert µ-law (ULAW/G.711) audio to 16-bit signed PCM
     
-    ✅ FIX #1: ULAW CODEC HANDLING - Added comprehensive logging for conversion validation
-    
-    Inverse of linear_to_ulaw
-    
-    Used when receiving RTP audio from Asterisk (ULAW) and need PCM for STT
-    
-    Handles empty or corrupted byte payloads safely without raising unhandled exceptions.
+    Part of Gemini Live audio handling pipeline
     
     Args:
         ulaw_bytes: µ-law encoded audio (8-bit)
@@ -365,37 +346,30 @@ def generate_beep_frames(duration_ms: int = 400, frequency_hz: int = 1000, ampli
         log.error(f"[BEEP] Generation error: {e}", exc_info=True)
         return None
 
-def convert_tts_audio_to_rtp_frames(tts_audio_bytes: bytes, frame_size: int = RTP_FRAME_SIZE, is_greeting: bool = False, call_id: str = None) -> Optional[list]:
+def convert_audio_to_rtp_frames(audio_bytes: bytes, frame_size: int = RTP_FRAME_SIZE, is_greeting: bool = False, call_id: str = None) -> Optional[list]:
     """
-    COMPLETE PIPELINE: TTS → PCM → ULAW → RTP Frames
+    GEMINI LIVE AUDIO PROCESSING: RTP ↔ Audio Conversion
     
-    ✅ CRITICAL FIX #3: End-to-end audio conversion from TTS to RTP transmission
-    ✅ TASK 1: Comprehensive diagnostic logging at each codec stage
-    
-    This is the CRITICAL missing piece that was causing "caller hears nothing"
+    Handles audio frame conversion for RTP transmission and reception
     
     Pipeline:
-    1. Decode base64-encoded WAV from Sarvam TTS API
-    2. Extract PCM samples from WAV
-    3. Resample to 8kHz if needed (Asterisk expects exactly 8kHz)
-    4. Convert to mono if needed
-    5. Convert PCM (16-bit) to µ-law (8-bit) for RTP transmission
-    6. Split into RTP frames (160 bytes = 20ms at 8kHz)
-    7. Pad last frame if needed
-    8. Validate frame count matches expected duration
+    1. Receive/send PCM audio (8kHz)
+    2. Convert to µ-law (8-bit) for RTP transmission if needed
+    3. Split into RTP frames (160 bytes = 20ms at 8kHz)
+    4. Manage frame boundaries and padding
     
     Args:
-        tts_audio_bytes: Audio bytes from TTS (WAV file or base64-encoded WAV)
+        audio_bytes: Audio bytes for processing
         frame_size: RTP frame size (default 160 bytes = 20ms)
-        is_greeting: If True, apply extra clarity enhancements for greeting audio
+        is_greeting: If True, apply clarity enhancements for greeting audio
         call_id: Call identifier for diagnostic logging (optional)
         
     Returns:
-        List of RTP-ready audio frames (each exactly 160 bytes) or None on error
+        List of RTP-ready audio frames or None on error
     """
     try:
-        if not tts_audio_bytes or len(tts_audio_bytes) == 0:
-            log.error(f"[CODEC-PIPELINE] ❌ Empty TTS audio")
+        if not audio_bytes or len(audio_bytes) == 0:
+            log.error(f"[CODEC-PIPELINE] ❌ Empty audio bytes")
             return None
 
         try:

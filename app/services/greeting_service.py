@@ -49,9 +49,10 @@ class GreetingService:
             # Mark greeting as played in state
             await self._mark_greeting_played(call_id)
             
-            # Note: Actual TTS and audio playback would happen here via media service
-            # For now, we're just marking it as handled
-            # The actual greeting playback would integrate with the media_service
+            # Greeting is delivered via Gemini Live audio streaming
+            log.info(f"[Greeting] Greeting will be delivered via Gemini Live")
+            
+            return True
             
             log.info(f"[Greeting] ✅ Greeting trigger set for {call_id}")
             return True

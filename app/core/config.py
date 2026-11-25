@@ -62,6 +62,24 @@ SUPPORTED_CODECS = {
 }
 
 # ═══════════════════════════════════════════════════════════
+# RTP IP CONFIGURATION
+# ═══════════════════════════════════════════════════════════
+LOCAL_RTP_IP = os.getenv("LOCAL_RTP_IP", "0.0.0.0")
+GREETING_RTP_WAIT_S = float(os.getenv("GREETING_RTP_WAIT_S", "2.0"))
+
+# ═══════════════════════════════════════════════════════════
+# AUDIO CODEC COMFORT NOISE
+# ═══════════════════════════════════════════════════════════
+RTP_COMFORT_NOISE_ULAW = b'\xff' * 160  # Silence frame in µLaw format
+
+# ═══════════════════════════════════════════════════════════
+# AUDIO MUTING CONFIGURATION (During AI Speaking)
+# ═══════════════════════════════════════════════════════════
+AUDIO_MUTING_ENABLED = os.getenv("AUDIO_MUTING_ENABLED", "true").lower() == "true"
+AUDIO_MUTING_POST_TTS_CLEAR_DELAY_MS = int(os.getenv("AUDIO_MUTING_POST_TTS_CLEAR_DELAY_MS", "200"))
+PREFLUSH_RX_BUFFER_STALE_FRAMES = int(os.getenv("PREFLUSH_RX_BUFFER_STALE_FRAMES", "20"))
+
+# ═══════════════════════════════════════════════════════════
 # DATABASE CONFIGURATION
 # ═══════════════════════════════════════════════════════════
 DB_HOST = os.getenv("DB_HOST", "localhost")
@@ -113,38 +131,11 @@ LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.3"))
 LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "500"))
 
 # ═══════════════════════════════════════════════════════════
-# SPEECH-TO-TEXT CONFIGURATION
+# AUDIO PARAMETERS
 # ═══════════════════════════════════════════════════════════
-SARVAM_API_KEY = os.getenv("SARVAM_API_KEY", "")
-SARVAM_STT_MODEL = os.getenv("SARVAM_STT_MODEL", "saaras:v3")
-SARVAM_STT_LANGUAGE = os.getenv("SARVAM_STT_LANGUAGE", "en")
-
-# Audio Parameters
-STT_SAMPLE_RATE = "8000"
-STT_INPUT_CODEC = "wav"
-STT_CHUNK_SIZE_BYTES = 160
-STT_MIN_CONFIDENCE_THRESHOLD = float(os.getenv("STT_MIN_CONFIDENCE_THRESHOLD", "0.65"))
-
-# Timing Parameters
-PRE_ROLL_BUFFER_MS = int(os.getenv("PRE_ROLL_BUFFER_MS", "300"))
-PRE_ROLL_BUFFER_FRAMES = int(PRE_ROLL_BUFFER_MS // 20)
-END_SILENCE_MS = int(os.getenv("END_SILENCE_MS", "800"))
-END_SILENCE_FRAMES = int(END_SILENCE_MS // 20)
-MAX_UTTERANCE_MS = int(os.getenv("MAX_UTTERANCE_MS", "8000"))
-MAX_UTTERANCE_FRAMES = int(MAX_UTTERANCE_MS // 20)
-
-# ═══════════════════════════════════════════════════════════
-# TEXT-TO-SPEECH CONFIGURATION
-# ═══════════════════════════════════════════════════════════
-SARVAM_TTS_MODEL = os.getenv("SARVAM_TTS_MODEL", "bulbul:v3")
-SARVAM_TTS_SAMPLE_RATE = int(os.getenv("SARVAM_TTS_SAMPLE_RATE", "8000"))
-SARVAM_DEFAULT_VOICE = os.getenv("SARVAM_DEFAULT_VOICE", "agent")
-SARVAM_TTS_PACE = float(os.getenv("SARVAM_TTS_PACE", "1.0"))
-SARVAM_TTS_LOUDNESS = float(os.getenv("SARVAM_TTS_LOUDNESS", "1.0"))
-SARVAM_TTS_PITCH = float(os.getenv("SARVAM_TTS_PITCH", "1.0"))
-
-TTS_PLAYBACK_START_TARGET_MS = int(os.getenv("TTS_PLAYBACK_START_TARGET_MS", "800"))
-TTS_TOTAL_RESPONSE_TARGET_MS = int(os.getenv("TTS_TOTAL_RESPONSE_TARGET_MS", "1200"))
+# 8kHz PCM - Standard for Asterisk and Gemini Live
+AUDIO_SAMPLE_RATE = 8000
+AUDIO_FRAME_SIZE = 160  # 20ms frame at 8kHz
 
 # ═══════════════════════════════════════════════════════════
 # LANGUAGE CONFIGURATION
@@ -156,18 +147,6 @@ SUPPORTED_LANGUAGES = {
 DEFAULT_LANGUAGE = "en"
 
 # ═══════════════════════════════════════════════════════════
-# VOICE ACTIVITY DETECTION
-# ═══════════════════════════════════════════════════════════
-SPEECH_DETECTION_THRESHOLD = int(os.getenv("SPEECH_DETECTION_THRESHOLD", "2000"))
-NOISE_FLOOR_RMS = int(os.getenv("NOISE_FLOOR_RMS", "800"))
-SPEECH_RMS_FLOOR = int(os.getenv("SPEECH_RMS_FLOOR", "2000"))
-MIN_SPEECH_FRAMES = int(os.getenv("MIN_SPEECH_FRAMES", "8"))
-VAD_HANGOVER = int(os.getenv("VAD_HANGOVER", "15"))
-SILENCE_FRAMES_THRESHOLD = VAD_HANGOVER
-MIN_ENERGY_FRAMES_TO_RESUME = int(os.getenv("MIN_ENERGY_FRAMES_TO_RESUME", "2"))
-MIN_SPEECH_DURATION_FRAMES = int(os.getenv("MIN_SPEECH_DURATION_FRAMES", "6"))
-
-# ═══════════════════════════════════════════════════════════
 # CONVERSATION CONFIGURATION
 # ═══════════════════════════════════════════════════════════
 MAX_CONVERSATION_HISTORY = int(os.getenv("MAX_CONVERSATION_HISTORY", "16"))
@@ -177,6 +156,4 @@ MAX_ACTIVE_CALLS = int(os.getenv("MAX_ACTIVE_CALLS", "200"))
 # WORKER THREADS
 # ═══════════════════════════════════════════════════════════
 THREAD_POOL_SIZE = int(os.getenv("THREAD_POOL_SIZE", "250"))
-TTS_WORKERS = int(os.getenv("TTS_WORKERS", "80"))
-STT_WORKERS = int(os.getenv("STT_WORKERS", "150"))
 DB_WORKERS = int(os.getenv("DB_WORKERS", "70"))

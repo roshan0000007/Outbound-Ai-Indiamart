@@ -2,32 +2,19 @@
 ENDPOINTING INTEGRATION MODULE
 ================================
 
-Integration layer for caller speech state machine into live_call_handler.
+Integration layer for call management with Gemini Live audio streaming.
 
 This module provides:
 1. Per-call state machine initialization
 2. Frame-by-frame processing integration
-3. Endpoint detection and audio freezing
-4. STT gateway enforcement
+3. Endpoint detection and audio buffering
+4. Direct Gemini Live streaming
 
 Usage in live_call_handler:
-    from ..services.endpointing_integration import EndpointingIntegration
-    
-    endpointing = EndpointingIntegration(call_id)
-    
-    # When AI responds:
-    endpointing.on_ai_speaking_start()
-    
-    # When AI finishes:
-    endpointing.on_ai_speaking_end()
-    
-    # For each RTP frame in listening loop:
-    should_freeze, reason = endpointing.process_frame(
-        frame=audio_frame,
-        frame_energy=rms_value,
-        is_speech_detected=vad_result
-    )
-    if should_freeze:
+    - Audio flows directly to Gemini Live
+    - No intermediate STT/TTS steps
+    - Real-time bidirectional streaming
+"""
         frozen_audio = endpointing.get_frozen_audio()
         # Send frozen audio to STT (no contamination)
 """
@@ -125,9 +112,9 @@ class EndpointingIntegration:
         """Get current state as string"""
         return self.state_machine.state.value
     
-    def move_to_stt_processing(self):
-        """Mark that STT processing has started"""
-        self.state_machine.move_to_stt_processing()
+    def on_audio_processing_complete(self):
+        """Mark that audio processing is complete - Ready for Gemini"""
+        self.state_machine.state = "ready_for_gemini"
     
     def get_diagnostics(self):
         """Get diagnostic information"""

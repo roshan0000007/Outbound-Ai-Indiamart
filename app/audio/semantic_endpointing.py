@@ -272,7 +272,7 @@ class DynamicEndpointingController:
         Called each time interim STT result arrives during speech collection.
         
         Args:
-            transcript: Partial STT transcript from Sarvam API
+            transcript: Partial transcript from speech recognition
             
         Returns:
             Recommended silence hangover (milliseconds)
