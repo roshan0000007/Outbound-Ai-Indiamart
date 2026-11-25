@@ -1,8 +1,10 @@
 """
 Real-Time Media Service
 Manages bidirectional audio streaming between Asterisk and Python.
-Handles RTP reception, STT, LLM, TTS, and RTP transmission.
+Handles RTP reception, LLM, and RTP transmission.
 """
+
+from __future__ import annotations
 
 import asyncio
 import struct
