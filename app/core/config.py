@@ -112,7 +112,7 @@ REDIS_URL = (
 # GEMINI LIVE API CONFIGURATION
 # ═══════════════════════════════════════════════════════════
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_LIVE_MODEL = os.getenv("GEMINI_LIVE_MODEL", "gemini-2.5-flash-native-audio-preview-12-2025")
+GEMINI_LIVE_MODEL = os.getenv("GEMINI_LIVE_MODEL", "gemini-3.8-live")
 GEMINI_VOICE = os.getenv("GEMINI_VOICE", "Aoede")
 
 # Gemini Live Audio Streaming Configuration

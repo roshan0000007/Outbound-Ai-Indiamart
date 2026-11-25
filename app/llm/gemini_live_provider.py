@@ -26,10 +26,9 @@ class GeminiLiveProvider:
     - No intermediate STT/TTS processing required
     - 8kHz PCM audio streaming
     """
-
     def __init__(self):
         self.api_key = os.getenv("GEMINI_API_KEY", "")
-        self.model = os.getenv("GEMINI_LIVE_MODEL", "gemini-2.0-flash-exp")
+        self.model = os.getenv("GEMINI_LIVE_MODEL", "gemini-3.8-live")
         self.voice = os.getenv("GEMINI_VOICE", "Aoede")
         self.client = None
         self.session = None
@@ -44,9 +43,12 @@ class GeminiLiveProvider:
             "sample_rate_hertz": 8000,
         }
         self.stream_lock = asyncio.Lock()
+        
+        # Session ready event for greeting synchronization
+        self.session_ready_event = asyncio.Event()
 
     async def initialize(self) -> bool:
-        """Initialize Gemini Live client using google-genai"""
+        """Initialize Gemini Live client using google-genai SDK with proper API version"""
         try:
             if not self.api_key:
                 log.error("[Gemini Live] API key not configured")
@@ -55,11 +57,16 @@ class GeminiLiveProvider:
             try:
                 from google import genai
                 
-                # Create client with new SDK
-                self.client = genai.Client(api_key=self.api_key)
+                # Create client with official google-genai SDK
+                # Use v1beta for Gemini Live API endpoint
+                self.client = genai.Client(
+                    api_key=self.api_key,
+                    http_options={"api_version": "v1beta"}
+                )
                 
-                log.info(f"[Gemini Live] ✅ Client initialized successfully (google-genai)")
+                log.info(f"[Gemini Live] ✅ Client initialized successfully (google-genai SDK)")
                 log.info(f"[Gemini Live]    ├─ Model: {self.model}")
+                log.info(f"[Gemini Live]    ├─ API Version: v1beta")
                 log.info(f"[Gemini Live]    ├─ Voice: {self.voice}")
                 log.info(f"[Gemini Live]    ├─ Audio Config: {self.audio_config}")
                 log.info(f"[Gemini Live]    ├─ Temperature: {self.temperature}")
@@ -72,7 +79,7 @@ class GeminiLiveProvider:
                 return False
 
         except Exception as e:
-            log.error(f"[Gemini Live] Initialization failed: {e}")
+            log.error(f"[Gemini Live] Initialization failed: {e}", exc_info=True)
             return False
 
     async def create_live_session(self, system_prompt: Optional[str] = None) -> bool:
@@ -112,10 +119,15 @@ class GeminiLiveProvider:
             }
 
             log.info(f"[Gemini Live] ✅ Session created: {self.session_id}")
+            
+            # Signal that session is ready for greeting
+            self.session_ready_event.set()
+            log.info(f"[Gemini Live] ✅ Session ready event signaled - greeting can proceed")
+            
             return True
 
         except Exception as e:
-            log.error(f"[Gemini Live] Session creation error: {e}")
+            log.error(f"[Gemini Live] Session creation error: {e}", exc_info=True)
             return False
 
     async def stream_audio_bidirectional(
@@ -158,7 +170,7 @@ class GeminiLiveProvider:
                 
                 log.info(f"[Gemini Live] Using model: {model_for_live}")
 
-                # ✅ CRITICAL: Create WebSocket connection with proper error handling
+                # ✅ CRITICAL: Create WebSocket connection with response_modalities=["AUDIO"]
                 try:
                     async with self.client.aio.live.connect(
                         model=model_for_live,
@@ -167,6 +179,8 @@ class GeminiLiveProvider:
                                 temperature=self.temperature,
                                 max_output_tokens=self.max_tokens,
                             ),
+                            # ✅ CRITICAL: Configure audio response output
+                            response_modalities=["AUDIO"],
                             system_instruction=self.session.get('system_prompt', 
                                 "You are a helpful sales assistant. Respond concisely and naturally."),
                         ),

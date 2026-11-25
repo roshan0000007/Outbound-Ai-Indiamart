@@ -4,6 +4,7 @@ Processes Asterisk ARI WebSocket events
 Routes events to appropriate call handlers
 """
 
+import asyncio
 from typing import Dict, Any, Optional
 from datetime import datetime
 import uuid
@@ -196,20 +197,47 @@ async def handle_stasis_start(event: Dict[str, Any]) -> bool:
         except Exception as e:
             log.warning(f"[ARI] Failed to initialize requirements: {e}")
         
-        # Trigger greeting
-        try:
-            from ..services.greeting_service import get_greeting_service
-            greeting_service = get_greeting_service()
-            if greeting_service:
-                await greeting_service.play_greeting(call_id)
-                log.info(f"[ARI] ✅ Greeting triggered: {call_id}")
-        except Exception as e:
-            log.warning(f"[ARI] Failed to trigger greeting: {e}")
-        
-        # Start listening for audio
+        # ========== STEP 6: Start listening for audio (Gemini session initialization) ==========
         live_handler = get_live_call_handler()
         if live_handler:
-            await live_handler.start_listening(call_id)
+            listen_success = await live_handler.start_listening(call_id)
+            if not listen_success:
+                log.warning(f"[ARI] Failed to start listening, but continuing call")
+        
+        # ========== STEP 7: Wait for Gemini session ready, then send greeting ==========
+        try:
+            from ..services.gemini_audio_pipeline import get_gemini_provider
+            gemini_provider = get_gemini_provider()
+            
+            if gemini_provider and hasattr(gemini_provider, 'session_ready_event'):
+                # Wait for Gemini session to be ready (with 10 second timeout)
+                try:
+                    log.info(f"[ARI] ⏳ Waiting for Gemini session ready event (timeout: 10s)...")
+                    await asyncio.wait_for(
+                        gemini_provider.session_ready_event.wait(),
+                        timeout=10.0
+                    )
+                    log.info(f"[ARI] ✅ Gemini session ready! Now sending greeting...")
+                    
+                    # Now send greeting
+                    from ..services.greeting_service import get_greeting_service
+                    greeting_service = get_greeting_service()
+                    if greeting_service:
+                        await greeting_service.play_greeting(call_id)
+                        log.info(f"[ARI] ✅ Greeting sent to Gemini Live: {call_id}")
+                except asyncio.TimeoutError:
+                    log.error(f"[ARI] ❌ Gemini session ready timeout (10s) - greeting not sent")
+                except Exception as e:
+                    log.error(f"[ARI] Error waiting for session ready: {e}", exc_info=True)
+            else:
+                log.warning(f"[ARI] Gemini provider not available - sending greeting immediately")
+                from ..services.greeting_service import get_greeting_service
+                greeting_service = get_greeting_service()
+                if greeting_service:
+                    await greeting_service.play_greeting(call_id)
+                    
+        except Exception as e:
+            log.error(f"[ARI] Error in greeting orchestration: {e}", exc_info=True)
 
         return True
 

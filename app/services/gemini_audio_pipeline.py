@@ -276,3 +276,8 @@ async def cleanup_all_sessions() -> bool:
     except Exception as e:
         log.error(f"[Gemini Audio] Error cleaning up sessions: {e}")
         return False
+
+
+def get_gemini_provider():
+    """Get the Gemini Live provider instance"""
+    return get_gemini_live_provider()
