@@ -159,6 +159,7 @@ class GeminiLiveProvider:
         """
         try:
             from google import genai
+            from google.genai import types
             
             if not self.session or not self.client:
                 log.error("[Gemini Live] ❌ Session not active - cannot stream audio")
@@ -184,8 +185,8 @@ class GeminiLiveProvider:
 
                 async with self.client.aio.live.connect(
                     model=model_for_live,
-                    config=genai.types.LiveConnectConfig(
-                        generation_config=genai.types.GenerationConfig(
+                    config=types.LiveConnectConfig(
+                        generation_config=types.GenerationConfig(
                             temperature=self.temperature,
                             max_output_tokens=self.max_tokens,
                         ),
@@ -201,14 +202,20 @@ class GeminiLiveProvider:
                     if greeting_text:
                         try:
                             log.info(f"[Gemini Live] 📤 Sending greeting: '{greeting_text[:60]}...'")
-                            # Send greeting text message via generic message (not audio)
-                            # This should trigger Gemini to respond with spoken greeting
-                            # The exact message format depends on google-genai SDK
-                            # For now we'll prepare it as a text turn that Gemini will synthesize
-                            greeting_message = f"Please say the following greeting: {greeting_text}"
-                            log.info(f"[Gemini Live] ⏳ Waiting for Gemini to synthesize greeting...")
+                            # Send greeting as text turn using proper API
+                            await session.send(
+                                types.ClientContentExt(
+                                    turns=[
+                                        types.Turn(
+                                            role="user",
+                                            parts=[types.Part(text=greeting_text)]
+                                        )
+                                    ]
+                                )
+                            )
+                            log.info(f"[Gemini Live] ⏳ Greeting sent, waiting for Gemini to synthesize audio...")
                         except Exception as greeting_error:
-                            log.error(f"[Gemini Live] Error sending greeting: {greeting_error}")
+                            log.error(f"[Gemini Live] Error sending greeting: {greeting_error}", exc_info=True)
 
                     # Create concurrent tasks for sending and receiving
                     async def send_audio_to_gemini():
@@ -222,18 +229,34 @@ class GeminiLiveProvider:
                                     if frame_count % 50 == 0:
                                         log.debug(f"[Gemini Live] 📤 Processing {frame_count} caller audio frames")
                                     
-                                    # Note: Actual sending via session.send() removed due to API signature issues
-                                    # The main pipeline in gemini_audio_pipeline.py handles actual streaming
+                                    # Send audio using proper API (realtime_input)
+                                    try:
+                                        await session.send(
+                                            types.ClientContentExt(
+                                                realtime_input=types.Content(
+                                                    parts=[
+                                                        types.Part(
+                                                            inline_data=types.Blob(
+                                                                mime_type="audio/pcm;rate=16000",
+                                                                data=audio_chunk
+                                                            )
+                                                        )
+                                                    ]
+                                                )
+                                            )
+                                        )
+                                    except Exception as send_error:
+                                        log.error(f"[Gemini Live] Error sending audio chunk {frame_count}: {send_error}")
                                 
                                 await asyncio.sleep(0.001)
                             
-                            log.info(f"[Gemini Live] Audio input complete: {frame_count} frames buffered")
+                            log.info(f"[Gemini Live] Audio input complete: {frame_count} frames sent")
                             
                         except asyncio.CancelledError:
                             log.info(f"[Gemini Live] Audio send task cancelled")
                             raise
                         except Exception as e:
-                            log.error(f"[Gemini Live] ❌ Error processing audio: {e}")
+                            log.error(f"[Gemini Live] ❌ Error processing audio: {e}", exc_info=True)
                             raise
 
                     async def receive_audio_from_gemini():
@@ -281,7 +304,7 @@ class GeminiLiveProvider:
                             log.info(f"[Gemini Live] Audio receive task cancelled")
                             raise
                         except Exception as e:
-                            log.error(f"[Gemini Live] ❌ Error receiving audio from Gemini: {e}")
+                            log.error(f"[Gemini Live] ❌ Error receiving audio from Gemini: {e}", exc_info=True)
                             raise
 
                     # Run send and receive concurrently
@@ -292,11 +315,11 @@ class GeminiLiveProvider:
                             return_exceptions=False
                         )
                     except Exception as gather_error:
-                        log.error(f"[Gemini Live] ❌ Concurrent streaming error: {gather_error}")
+                        log.error(f"[Gemini Live] ❌ Concurrent streaming error: {gather_error}", exc_info=True)
                         raise
 
                     log.info(f"[Gemini Live] ✅ Bidirectional streaming complete")
-                    log.info(f"[Gemini Live]    ├─ Caller audio: {frame_count} frames buffered")
+                    log.info(f"[Gemini Live]    ├─ Caller audio: {frame_count} frames sent")
                     log.info(f"[Gemini Live]    ├─ Gemini response: {response_frames} frames received ✅")
                     log.info(f"[Gemini Live]    ├─ Response audio size: {len(response_audio)} bytes")
                     log.info(f"[Gemini Live]    └─ Ready for next turn")

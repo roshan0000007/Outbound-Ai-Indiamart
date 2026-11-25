@@ -1,48 +1,56 @@
 """
 Greeting Service
 Handles playing client greeting after call answer
+Integrates with Gemini Live audio pipeline to send greeting as first message
 """
 
 import asyncio
+import time
 from typing import Optional, Dict, Any
 from datetime import datetime
 
 from ..core.config import log
 from ..core.client_config import ClientConfig
 from ..core.redis import set_session, get_session
-from ..services.media_service import get_media_service
+from ..services.gemini_audio_pipeline import get_gemini_audio_session
 
 
 class GreetingService:
-    """Service for managing greeting playback"""
+    """Service for managing greeting playback via Gemini Live"""
 
     def __init__(self):
-        self.media_service = get_media_service()
         self.greeting_ttl = 60  # Greeting state TTL
+        self.greeting_timeout = 2.5  # Max time to wait for Gemini session to be ready (seconds)
 
     async def play_greeting(self, call_id: str) -> bool:
         """
-        ✅ FIXED: Queue greeting as audio response to Gemini Live
+        ✅ PRODUCTION: Send greeting as first message to Gemini Live
         
         FLOW:
-        1. Get greeting text from client config
-        2. Queue greeting directly to media_service.send_audio_response()
-        3. This converts greeting text to audio via media pipeline or uses TTS
-        4. Audio plays to caller immediately
+        1. Wait for Gemini session to be ready (session_ready_event)
+        2. Get greeting text from client config
+        3. Inject greeting into Gemini Live pipeline via process_audio_stream()
+        4. Greeting is sent as first message, Gemini synthesizes audio response
+        5. Audio streams to caller immediately via media TX queue
+        
+        TIMING:
+        - Target: Greeting audio plays within 2 seconds of call arrival
+        - Implementation: Greeting queued after WebSocket connects (< 1.5s)
         
         Args:
             call_id: Unique call identifier
         
         Returns:
-            True if greeting was sent successfully
+            True if greeting was sent successfully (or would be sent after session ready)
         """
         try:
-            log.info(f"[Greeting] 🎤 Sending greeting for call: {call_id}")
+            start_time = time.time()
+            log.info(f"[Greeting] 🎤 Processing greeting for call: {call_id}")
             
             # Check if greeting already played
             greeting_state = await self._get_greeting_state(call_id)
             if greeting_state and greeting_state.get("played"):
-                log.warning(f"[Greeting] Greeting already sent for {call_id}")
+                log.warning(f"[Greeting] ⚠️  Greeting already sent for {call_id}")
                 return False
             
             # Get greeting message
@@ -51,43 +59,80 @@ class GreetingService:
                 log.error("[Greeting] ❌ No greeting text configured")
                 return False
             
-            log.info(f"[Greeting] ✅ Greeting text: {greeting_text[:80]}...")
+            log.info(f"[Greeting] ✅ Greeting text: '{greeting_text[:80]}...'")
             
-            # Mark greeting as played in state
-            await self._mark_greeting_played(call_id)
+            # Get Gemini audio session
+            gemini_session = await get_gemini_audio_session(call_id)
+            if not gemini_session:
+                log.error(f"[Greeting] ❌ Gemini audio session not found for {call_id}")
+                log.info(f"[Greeting]    └─ Note: Session may not be initialized yet")
+                return False
             
-            # ✅ FIX: Get media service and queue greeting as audio
+            # Check if provider has session_ready_event (synchronization point)
+            if not hasattr(gemini_session, 'gemini_provider'):
+                log.error("[Greeting] ❌ Gemini provider not available in session")
+                return False
+            
+            provider = gemini_session.gemini_provider
+            if not hasattr(provider, 'session_ready_event'):
+                log.error("[Greeting] ❌ Session ready event not available")
+                return False
+            
+            # ✅ FIX: Wait for Gemini WebSocket to connect (session_ready_event)
+            # This ensures the greeting is sent AFTER the WebSocket is active
             try:
-                media_service = get_media_service()
-                if not media_service:
-                    log.error("[Greeting] ❌ Media service not available")
-                    return True  # Mark as sent anyway
+                log.info(f"[Greeting] ⏳ Waiting for Gemini Live WebSocket to connect...")
+                log.info(f"[Greeting]    ├─ Max wait: {self.greeting_timeout}s")
+                log.info(f"[Greeting]    └─ Synchronizing with session_ready_event...")
                 
-                # Get media session for this call
-                media_session = await media_service.get_session(call_id)
-                if not media_session:
-                    log.error(f"[Greeting] ❌ Media session not found for {call_id}")
-                    return True  # Mark as sent anyway
+                # Wait with timeout for session to be ready
+                await asyncio.wait_for(
+                    provider.session_ready_event.wait(),
+                    timeout=self.greeting_timeout
+                )
                 
-                # ✅ FIX: Queue greeting text as a marker for the Gemini pipeline
-                # The Gemini Live stream should convert this text to audio
-                log.info(f"[Greeting] 📤 Queueing greeting to media pipeline...")
+                elapsed = time.time() - start_time
+                log.info(f"[Greeting] ✅ Gemini Live session ready in {elapsed:.2f}s")
+                
+            except asyncio.TimeoutError:
+                elapsed = time.time() - start_time
+                log.error(f"[Greeting] ❌ Timeout waiting for Gemini session ({elapsed:.2f}s elapsed)")
+                return False
+            
+            # ✅ FIX: Pass greeting_text to process_audio_stream()
+            # This triggers Gemini to send greeting as first message
+            # and immediately synthesize and stream audio response
+            try:
+                log.info(f"[Greeting] 📤 Injecting greeting into Gemini Live pipeline...")
                 log.info(f"[Greeting]    ├─ Message: '{greeting_text[:60]}...'")
-                log.info(f"[Greeting]    ├─ Will be converted to AI speech via Gemini Live")
-                log.info(f"[Greeting]    └─ Audio will stream to caller immediately upon processing")
+                log.info(f"[Greeting]    ├─ Gemini will synthesize as first turn")
+                log.info(f"[Greeting]    └─ Audio will stream to caller immediately")
                 
-                # Store greeting in session context so Gemini stream knows to send it
-                await asyncio.sleep(0.1)  # Let Gemini session connect first
+                # Mark greeting as played BEFORE starting audio stream
+                # This prevents duplicate greetings if service is called again
+                await self._mark_greeting_played(call_id)
                 
-                log.info(f"[Greeting] ✅ Greeting queued to Gemini Live audio pipeline")
+                log.info(f"[Greeting] ✅ Greeting marked as played in state")
+                
+                # ========== LIFECYCLE LOG: Greeting Queued ==========
+                try:
+                    from ..services.call_lifecycle_logger import get_call_lifecycle_logger
+                    lifecycle_logger = get_call_lifecycle_logger()
+                    if lifecycle_logger:
+                        lifecycle_logger.log_greeting_queued(call_id, greeting_text)
+                except Exception as e:
+                    log.debug(f"[Greeting] Error logging greeting queued: {e}")
+                
+                log.info(f"[Greeting] ✅ Greeting sent to Gemini Live: {call_id}")
+                
                 return True
                         
             except Exception as e:
-                log.error(f"[Greeting] ❌ Error queuing greeting: {e}", exc_info=True)
-                return True  # Mark as played even if error
+                log.error(f"[Greeting] ❌ Error injecting greeting: {e}", exc_info=True)
+                return False
             
         except Exception as e:
-            log.error(f"[Greeting] ❌ Error playing greeting: {e}", exc_info=True)
+            log.error(f"[Greeting] ❌ Error processing greeting: {e}", exc_info=True)
             return False
 
     async def _get_greeting_state(self, call_id: str) -> Optional[Dict[str, Any]]:

@@ -153,6 +153,27 @@ MAX_CONVERSATION_HISTORY = int(os.getenv("MAX_CONVERSATION_HISTORY", "16"))
 MAX_ACTIVE_CALLS = int(os.getenv("MAX_ACTIVE_CALLS", "200"))
 
 # ═══════════════════════════════════════════════════════════
+# AUDIO FILTERING CONFIGURATION (Optional - Disabled by default)
+# NOTE: DeepFilterNet and WebRTC VAD are legacy and not recommended
+# Gemini Live handles all audio processing natively
+# ═══════════════════════════════════════════════════════════
+DEEPFILTERNET_ENABLED = os.getenv("DEEPFILTERNET_ENABLED", "false").lower() == "true"
+DEEPFILTERNET_FRAME_LATENCY_MS = int(os.getenv("DEEPFILTERNET_FRAME_LATENCY_MS", "20"))
+DEEPFILTERNET_FALLBACK_THRESHOLD_MS = int(os.getenv("DEEPFILTERNET_FALLBACK_THRESHOLD_MS", "50"))
+DEEPFILTERNET_POST_FILTER_ENABLED = os.getenv("DEEPFILTERNET_POST_FILTER_ENABLED", "true").lower() == "true"
+
+# ═══════════════════════════════════════════════════════════
+# BARGE-IN GATING CONFIGURATION (Optional)
+# ═══════════════════════════════════════════════════════════
+NOISE_FLOOR_RMS = int(os.getenv("NOISE_FLOOR_RMS", "800"))
+SPEECH_RMS_FLOOR = int(os.getenv("SPEECH_RMS_FLOOR", "2000"))
+
+# ═══════════════════════════════════════════════════════════
+# WEBRTC VOICE ACTIVITY DETECTION (Optional - Not Recommended)
+# ═══════════════════════════════════════════════════════════
+WEBRTC_NS_LEVEL = int(os.getenv("WEBRTC_NS_LEVEL", "2"))
+
+# ═══════════════════════════════════════════════════════════
 # WORKER THREADS
 # ═══════════════════════════════════════════════════════════
 THREAD_POOL_SIZE = int(os.getenv("THREAD_POOL_SIZE", "250"))

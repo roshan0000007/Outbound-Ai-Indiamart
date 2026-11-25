@@ -107,6 +107,15 @@ async def handle_stasis_start(event: Dict[str, Any]) -> bool:
 
         log.info(f"[ARI] ✅ Call started: {call_id} from {caller_number} to {dnid}")
 
+        # ========== LIFECYCLE LOG: Call Start ==========
+        try:
+            from ..services.call_lifecycle_logger import get_call_lifecycle_logger
+            lifecycle_logger = get_call_lifecycle_logger()
+            if lifecycle_logger:
+                lifecycle_logger.log_call_start(call_id, caller_number, dnid)
+        except Exception as e:
+            log.warning(f"[ARI] Error logging call start: {e}")
+
         # ========== STEP 1: Initialize call session and media ==========
         call_handler = get_call_handler()
         success = await call_handler.on_call_start(
@@ -146,6 +155,15 @@ async def handle_stasis_start(event: Dict[str, Any]) -> bool:
             return False
         
         log.info(f"[ARI-ORCHESTRATION] ✅ Bridge created: {bridge_id}")
+
+        # ========== LIFECYCLE LOG: Bridge Ready ==========
+        try:
+            from ..services.call_lifecycle_logger import get_call_lifecycle_logger
+            lifecycle_logger = get_call_lifecycle_logger()
+            if lifecycle_logger:
+                lifecycle_logger.log_bridge_ready(call_id, bridge_id)
+        except Exception as e:
+            log.warning(f"[ARI] Error logging bridge ready: {e}")
 
         # ========== STEP 3: Add original caller channel to bridge ==========
         added_caller = await add_channel_to_bridge(bridge_id, call_id)
@@ -204,40 +222,17 @@ async def handle_stasis_start(event: Dict[str, Any]) -> bool:
             if not listen_success:
                 log.warning(f"[ARI] Failed to start listening, but continuing call")
         
-        # ========== STEP 7: Wait for Gemini session ready, then send greeting ==========
-        try:
-            from ..services.gemini_audio_pipeline import get_gemini_provider
-            gemini_provider = get_gemini_provider()
-            
-            if gemini_provider and hasattr(gemini_provider, 'session_ready_event'):
-                # Wait for Gemini session to be ready (with 10 second timeout)
-                try:
-                    log.info(f"[ARI] ⏳ Waiting for Gemini session ready event (timeout: 10s)...")
-                    await asyncio.wait_for(
-                        gemini_provider.session_ready_event.wait(),
-                        timeout=10.0
-                    )
-                    log.info(f"[ARI] ✅ Gemini session ready! Now sending greeting...")
-                    
-                    # Now send greeting
-                    from ..services.greeting_service import get_greeting_service
-                    greeting_service = get_greeting_service()
-                    if greeting_service:
-                        await greeting_service.play_greeting(call_id)
-                        log.info(f"[ARI] ✅ Greeting sent to Gemini Live: {call_id}")
-                except asyncio.TimeoutError:
-                    log.error(f"[ARI] ❌ Gemini session ready timeout (10s) - greeting not sent")
-                except Exception as e:
-                    log.error(f"[ARI] Error waiting for session ready: {e}", exc_info=True)
-            else:
-                log.warning(f"[ARI] Gemini provider not available - sending greeting immediately")
-                from ..services.greeting_service import get_greeting_service
-                greeting_service = get_greeting_service()
-                if greeting_service:
-                    await greeting_service.play_greeting(call_id)
-                    
-        except Exception as e:
-            log.error(f"[ARI] Error in greeting orchestration: {e}", exc_info=True)
+        # ========== STEP 7: Gemini session will start automatically in Step 6 ==========
+        # Note: The greeting is already integrated into stream_audio_via_gemini()
+        # via ClientConfig.get_greeting() call in media_service.py
+        # No need for separate greeting service call - it's part of the pipeline
+        
+        log.info(f"[ARI] ✅✅✅ CALL ORCHESTRATION COMPLETE FOR {call_id}")
+        log.info(f"[ARI]    ├─ Bridge: {bridge_id} (caller ↔ ExternalMedia)")
+        log.info(f"[ARI]    ├─ RTP endpoint: 163.223.186.31:{allocated_rtp_port}")
+        log.info(f"[ARI]    ├─ Gemini Live will initialize when start_listening() is called")
+        log.info(f"[ARI]    ├─ Greeting will be sent as first message to Gemini")
+        log.info(f"[ARI]    └─ Audio streaming: RTP ↔ Gemini ↔ RTP TX")
 
         return True
 
@@ -265,6 +260,15 @@ async def handle_stasis_end(event: Dict[str, Any]) -> bool:
             return False
 
         log.info(f"[ARI] Call ended: {call_id}")
+
+        # ========== LIFECYCLE LOG: Call End ==========
+        try:
+            from ..services.call_lifecycle_logger import get_call_lifecycle_logger
+            lifecycle_logger = get_call_lifecycle_logger()
+            if lifecycle_logger:
+                stats = lifecycle_logger.log_call_end(call_id, reason="StasisEnd")
+        except Exception as e:
+            log.debug(f"[ARI] Error logging call end: {e}")
 
         # Stop listening
         live_handler = get_live_call_handler()

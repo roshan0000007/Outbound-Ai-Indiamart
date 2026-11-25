@@ -141,6 +141,22 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             log.warning(f"[STARTUP] Greeting service initialization failed: {e}")
 
+        # Initialize LLM failover service (Gemini Live → Groq)
+        try:
+            from app.services.llm_failover_service import init_llm_failover_service
+            await init_llm_failover_service()
+            log.info("[STARTUP] ✓ LLM failover service initialized (Gemini Live → Groq)")
+        except Exception as e:
+            log.warning(f"[STARTUP] LLM failover service initialization failed: {e}")
+
+        # Initialize call lifecycle logger (latency tracking)
+        try:
+            from app.services.call_lifecycle_logger import init_call_lifecycle_logger
+            await init_call_lifecycle_logger()
+            log.info("[STARTUP] ✓ Call lifecycle logger initialized (latency tracking)")
+        except Exception as e:
+            log.warning(f"[STARTUP] Call lifecycle logger initialization failed: {e}")
+
         # Initialize call handler
         try:
             await init_call_handler()

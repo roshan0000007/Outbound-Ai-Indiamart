@@ -57,6 +57,16 @@ class CallHandler:
 
             log.info(f"[CallHandler] ✅ Session initialized for {call_id}")
             
+            # Initialize LLM failover service for this call
+            try:
+                from ..services.llm_failover_service import get_llm_failover_service
+                failover_service = get_llm_failover_service()
+                if failover_service:
+                    await failover_service.initialize_call(call_id)
+                    log.info(f"[CallHandler] ✅ LLM failover initialized: Gemini Live → Groq")
+            except Exception as e:
+                log.warning(f"[CallHandler] Error initializing failover: {e}")
+            
             # 🔧 CRITICAL: Create media (RTP) session for audio streaming
             try:
                 from ..services.media_service import get_media_service, MediaConfig
@@ -81,6 +91,15 @@ class CallHandler:
                     media_session = await media_service.create_session(media_config)
                     if media_session:
                         log.info(f"[CallHandler] ✅ Media session created for {call_id}")
+                        
+                        # ========== LIFECYCLE LOG: Media Session Ready ==========
+                        try:
+                            from ..services.call_lifecycle_logger import get_call_lifecycle_logger
+                            lifecycle_logger = get_call_lifecycle_logger()
+                            if lifecycle_logger and hasattr(media_session, 'local_port'):
+                                lifecycle_logger.log_media_session_ready(call_id, media_session.local_port)
+                        except Exception as e:
+                            log.debug(f"[CallHandler] Error logging media session ready: {e}")
                     else:
                         log.warning(f"[CallHandler] Failed to create media session, audio may not work")
                 else:
@@ -219,6 +238,18 @@ class CallHandler:
             # Close session
             await session_mgr.close_session(call_id)
             log.info(f"[CallHandler] ✅ Session closed for {call_id}")
+            
+            # Cleanup LLM failover service for this call
+            try:
+                from ..services.llm_failover_service import get_llm_failover_service
+                failover_service = get_llm_failover_service()
+                if failover_service:
+                    stats = await failover_service.cleanup_call(call_id)
+                    if stats:
+                        log.info(f"[CallHandler] LLM failover stats: {stats}")
+            except Exception as e:
+                log.warning(f"[CallHandler] Error cleaning up failover service: {e}")
+            
             return True
 
         except Exception as e:

@@ -1,12 +1,7 @@
 """
 Audio Processing Module
 
-4-Layer Noise Isolation & Semantic Turn-Taking Pipeline:
-
-PHASE 1: Acoustic Noise Suppression + Band-Pass Filter
-- RNNoise integration (lightweight, 8kHz telephony)
-- Band-pass filter (80Hz-3.4kHz telephony voice range)
-- Processes audio BEFORE VAD for noise rejection
+Semantic Turn-Taking & Smart Barge-In Pipeline:
 
 PHASE 2: Semantic / Context-Aware Endpointing
 - Analyze interim STT transcripts for completeness
@@ -18,16 +13,8 @@ PHASE 3: Smart Barge-In / Interruption Gate
 - Only genuine customer speech interrupts AI playback
 - Rejects coughs, background noise, short bursts
 
-PHASE 4: Speaker Voiceprint Isolation (optional, evaluate after Phase 1-3)
+NOTE: Acoustic noise suppression (Phase 1) is now handled by Gemini Live natively.
 """
-
-from .noise_suppression import (
-    AudioCleaningPipeline,
-    RNNoiseProcessor,
-    BandPassFilter,
-    get_audio_pipeline,
-    process_rtp_audio
-)
 
 from .semantic_endpointing import (
     CompletionSignal,
@@ -48,12 +35,6 @@ from .barge_in_gating import (
 )
 
 __all__ = [
-    "AudioCleaningPipeline",
-    "RNNoiseProcessor",
-    "BandPassFilter",
-    "get_audio_pipeline",
-    "process_rtp_audio",
-
     "CompletionSignal",
     "SemanticCompletenessAnalyzer",
     "DynamicEndpointingController",

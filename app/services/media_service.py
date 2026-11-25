@@ -415,15 +415,8 @@ class MediaSession:
                             continue
 
                         for ready_payload in ready_payloads:
-                            try:
-                                from ..core.config import PHASE1_NOISE_SUPPRESSION_ENABLED
-                                if PHASE1_NOISE_SUPPRESSION_ENABLED:
-                                    from ..audio.noise_suppression import process_rtp_audio
-                                    ready_payload = process_rtp_audio(ready_payload, preserve_raw=False)
-                            except ImportError:
-                                pass
-                            except Exception as e:
-                                log.warning(f"[MEDIA-RX] Phase 1 processing failed: {e}, using original payload")
+                            # Note: Noise suppression is now handled by Gemini Live natively
+                            # Legacy Phase 1 processing removed
 
                             if len(self.rx_buffer) == self.rx_buffer.maxlen:
                                 log.warning(f"[MEDIA-RX] ⚠️ RX buffer full ({self.rx_buffer.maxlen} frames) - oldest frame evicted")
@@ -1230,55 +1223,77 @@ class MediaSession:
 
             # Create task to feed RTP audio to Gemini
             async def feed_rtp_to_gemini():
-                """Read RTP frames and feed to Gemini"""
+                """Read RTP frames and feed to Gemini (with proper codec conversion)"""
                 try:
+                    from ..services.audio_codec_pipeline import get_codec_pipeline
+                    
+                    codec_pipeline = await get_codec_pipeline(self.config.call_id)
                     frame_count = 0
+                    
                     while self.active and gemini_session.session_active:
-                        # Get audio chunk from RTP buffer
+                        # Get 8kHz PCMU frame from RTP buffer
                         audio_chunk = await self.get_received_audio_chunk(timeout_sec=0.1)
                         
                         if audio_chunk and len(audio_chunk) > 0:
-                            # Add to Gemini input
-                            await gemini_session.add_audio_input(audio_chunk)
-                            frame_count += 1
+                            # ✅ FIX #5: Convert 8kHz PCMU → 16kHz PCM16 for Gemini Live
+                            # This uses stateful resampling to avoid clicks/pops at frame boundaries
+                            pcm_16k = await codec_pipeline.process_rtp_rx_frame(audio_chunk)
                             
-                            if frame_count % 100 == 0:
-                                log.debug(f"[MEDIA-SESSION] Fed {frame_count} RTP frames to Gemini")
+                            if pcm_16k and len(pcm_16k) > 0:
+                                # Add 16kHz PCM16 to Gemini input
+                                await gemini_session.add_audio_input(pcm_16k)
+                                frame_count += 1
+                                
+                                if frame_count % 100 == 0:
+                                    log.debug(f"[MEDIA-SESSION] ✅ Fed {frame_count} RTP frames to Gemini (8kHz PCMU → 16kHz PCM16)")
                         
                         await asyncio.sleep(0.001)
 
                 except Exception as e:
-                    log.error(f"[MEDIA-SESSION] Error feeding RTP to Gemini: {e}")
+                    log.error(f"[MEDIA-SESSION] Error feeding RTP to Gemini: {e}", exc_info=True)
 
             # Create task to read Gemini response and send via RTP
             async def read_gemini_and_send_rtp():
-                """Read Gemini response audio and send via RTP"""
+                """Read Gemini response audio and send via RTP (with proper codec conversion)"""
                 try:
+                    from ..services.audio_codec_pipeline import get_codec_pipeline
+                    
+                    codec_pipeline = await get_codec_pipeline(self.config.call_id)
                     frame_count = 0
+                    
                     while self.active and gemini_session.session_active:
-                        # Get response audio from Gemini
+                        # Get 24kHz PCM16 response audio from Gemini Live
                         response_audio = await gemini_session.get_response_audio()
                         
                         if response_audio and len(response_audio) > 0:
-                            # ✅ FIX #3: Queue Gemini response audio for RTP transmission
-                            # This ensures response audio → TX queue → RTP → Caller
-                            try:
-                                self.tx_queue.put_nowait(response_audio)
-                                frame_count += 1
+                            # ✅ FIX #5: Convert 24kHz PCM16 → 8kHz PCMU for RTP TX
+                            # This uses stateful downsampling to avoid distortion
+                            pcmu_8k = await codec_pipeline.process_gemini_response_audio(response_audio)
+                            
+                            if pcmu_8k and len(pcmu_8k) > 0:
+                                # Slice into RTP frames if needed
+                                rtp_frames = codec_pipeline.slice_into_rtp_frames(pcmu_8k, frame_size=160)
                                 
-                                if on_response_audio:
-                                    on_response_audio(response_audio)
+                                if rtp_frames:
+                                    for rtp_frame in rtp_frames:
+                                        try:
+                                            self.tx_queue.put_nowait(rtp_frame)
+                                            frame_count += 1
+                                            
+                                            if on_response_audio:
+                                                on_response_audio(rtp_frame)
+                                                
+                                        except asyncio.QueueFull:
+                                            log.warning(f"[MEDIA-SESSION] TX queue full, dropping response frame")
                                 
                                 if frame_count % 20 == 0:
-                                    log.info(f"[MEDIA-SESSION] ✅ Queued {frame_count} Gemini response frames to TX (audio flowing to caller)")
-                                    
-                            except asyncio.QueueFull:
-                                log.warning(f"[MEDIA-SESSION] TX queue full, dropping response frame")
+                                    log.info(f"[MEDIA-SESSION] ✅ Queued {frame_count} Gemini response frames to TX "
+                                            f"(24kHz PCM16 → 8kHz PCMU - audio flowing to caller)")
                         
                         await asyncio.sleep(0.001)
 
                 except Exception as e:
-                    log.error(f"[MEDIA-SESSION] Error reading Gemini response: {e}")
+                    log.error(f"[MEDIA-SESSION] Error reading Gemini response: {e}", exc_info=True)
 
             # Create task to process Gemini stream and handle responses
             async def process_gemini_stream():
@@ -1561,7 +1576,7 @@ class MediaServiceManager:
     async def release_call_resources(self, call_id: str) -> bool:
         """
         Release all resources for a call
-        Called when a call ends - cleans up RTP port, session, buffers
+        Called when a call ends - cleans up RTP port, session, buffers, codec pipeline
         
         Args:
             call_id: Call ID to cleanup
@@ -1574,6 +1589,13 @@ class MediaServiceManager:
             
             # Close the session (which will close RTP socket)
             await self.close_session(call_id)
+            
+            # Clean up codec pipeline (releases resampling state)
+            try:
+                from ..services.audio_codec_pipeline import cleanup_codec_pipeline
+                await cleanup_codec_pipeline(call_id)
+            except Exception as e:
+                log.warning(f"[MEDIA-SERVICE] Error cleaning codec pipeline: {e}")
             
             # Get the port that was used for this call
             async with self.lock:
