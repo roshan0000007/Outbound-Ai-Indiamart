@@ -8,10 +8,14 @@ import os
 import asyncio
 import json
 import base64
+import warnings
 from typing import Optional, Dict, Any, Callable, AsyncIterator
 from datetime import datetime
 import websockets
 from websockets.exceptions import ConnectionClosed
+
+# Suppress deprecation warning - migration to google-genai planned
+warnings.filterwarnings('ignore', category=FutureWarning, module='google.generativeai')
 
 from ..core.config import log
 
