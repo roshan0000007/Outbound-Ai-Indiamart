@@ -1,0 +1,5 @@
+# Gemini Live Audio Streaming Requirements
+# Required for real-time speech-to-speech call handling
+
+google-generativeai>=0.4.0
+websockets>=11.0
