@@ -1264,7 +1264,7 @@ class MediaSession:
             return None
 
 
-
+class MediaServiceManager:
     """Manages multiple concurrent media sessions"""
 
     def __init__(self):
