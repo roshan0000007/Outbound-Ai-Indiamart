@@ -161,14 +161,14 @@ async def lifespan(app: FastAPI):
         try:
             from app.transport.asterisk import init_ari_websocket, register_event_handler
             from app.handlers.ari_event_handler import (
-                handle_stasis_start, handle_stasis_end, handle_channel_dtmf
+                handle_stasis_start, handle_stasis_end, handle_channel_dtmf_received
             )
 
             success = await init_ari_websocket()
             if success:
                 register_event_handler("StasisStart", handle_stasis_start)
                 register_event_handler("StasisEnd", handle_stasis_end)
-                register_event_handler("ChannelDtmfReceived", handle_channel_dtmf)
+                register_event_handler("ChannelDtmfReceived", handle_channel_dtmf_received)
                 log.info("[STARTUP] ✓ ARI WebSocket connected")
             else:
                 log.error("[STARTUP] ✗ ARI WebSocket connection failed")
