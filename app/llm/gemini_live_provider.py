@@ -311,7 +311,7 @@ class GeminiLiveProvider:
                     
                     answered.add(field)
                     stats["saved"] += 1
-                    log.info(f"[Gemini Live] Saved {field} = {value}")
+                    log.info(f"[Gemini Live] ✅ Saved {field} = '{value}'")
                     if on_field_saved:
                         try:
                             on_field_saved(field, value)
@@ -327,16 +327,22 @@ class GeminiLiveProvider:
                     id=fc.id, name=fc.name, response={"result": status},
                 ))
             await live.send_tool_response(function_responses=responses)
+            log.debug(f"[Gemini Live] Tool responses sent for {len(responses)} calls")
 
-            # Move on: next unanswered question, or the closing message when all are done
+            # ✅ CRITICAL: Move on to next question or closing
             nxt = next_unanswered_index()
             if nxt is None:
+                # All questions answered
                 if not state["closing_sent"]:
                     state["closing_sent"] = True
+                    log.info(f"[Gemini Live] ✅ All {len(answered)} details collected; sending closing")
                     await send_instruction(live, closing_instruction(lang))
-                    log.info("[Gemini Live] All details collected; sending closing")
             elif not state["greeting_pending"] and nxt != state["question_asked"]:
+                # More questions to ask
+                log.info(f"[Gemini Live] Moving to next question: {nxt + 1}/{len(REQUIRED_QUESTIONS)}")
                 await ask_question(live, nxt)
+            else:
+                log.debug(f"[Gemini Live] Waiting for more input (greeting_pending={state['greeting_pending']}, next_q={nxt}, last_q={state['question_asked']})")
 
         try:
             async with self.client.aio.live.connect(model=model_name, config=config) as live:
@@ -400,9 +406,13 @@ class GeminiLiveProvider:
                                 log.info(f"[Gemini Live] Turn {stats['turns']} complete")
 
                                 if state["greeting_pending"]:
+                                    # ✅ STEP 1: Greeting finished → Ask first question
                                     state["greeting_pending"] = False
                                     await ask_question(live, 0)
+                                    log.info("[Gemini Live] Greeting complete; waiting for customer response to Q1")
+                                    
                                 elif state["closing_sent"]:
+                                    # ✅ STEP FINAL: Closing finished → End call
                                     log.info("[Gemini Live] Closing message finished")
                                     if on_call_complete:
                                         try:
@@ -411,6 +421,12 @@ class GeminiLiveProvider:
                                             log.error(f"[Gemini Live] on_call_complete error: {cb_err}")
                                     closing_done.set()
                                     return
+                                    
+                                else:
+                                    # ✅ STEP NORMAL: Question asked and turn is complete
+                                    # Next action will come from handle_tool_calls() when customer response arrives
+                                    # Just continue listening for tool_call with record_answer
+                                    log.debug(f"[Gemini Live] Turn {stats['turns']} finished; waiting for customer response")
 
                         if not got_message:
                             log.warning("[Gemini Live] Server closed the receive stream")
