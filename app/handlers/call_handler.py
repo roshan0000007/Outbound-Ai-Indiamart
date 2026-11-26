@@ -117,22 +117,30 @@ class CallHandler:
 
     async def on_call_end(
         self,
-        call_id: str
+        call_id: str,
+        user_id: int = 0,
+        caller_number: str = "unknown"
     ) -> bool:
         """
-        When call ends - save conversation and cleanup
+        When call ends - save conversation and cleanup using proper termination sequence.
         
-        CRITICAL FIX: Wait for Gemini stream to fully close before extracting data
-        This prevents race condition where requirements are still being written to Redis
+        CRITICAL SEQUENCE:
+        1. Wait for Gemini session to fully close
+        2. Extract complete conversation from ConversationCaptureService
+        3. Take immutable snapshot for safe persistence
+        4. Perform database persistence with idempotent protection
+        5. Handle cleanup
         
         Args:
             call_id: Call ID
+            user_id: User ID
+            caller_number: Caller's phone number
             
         Returns:
             True if successful
         """
         try:
-            log.info(f"[CallHandler] Call end: {call_id}")
+            log.info(f"[CallHandler] 📞 Call ending: {call_id}")
 
             # 🔧 CRITICAL: Wait for Gemini session to fully close (max 3 seconds)
             try:
@@ -162,78 +170,118 @@ class CallHandler:
                 return False
 
             try:
-                # 🔧 FIX: Get requirements from BOTH Gemini session AND RequirementService
                 from ..services.customer_requirement_service import get_customer_requirement_service
                 from ..services.requirement_tools_service import get_requirement_tools_service
                 from ..services.lead_storage_service import get_lead_storage_service
+                from ..services.conversation_history_service import get_conversation_history_service
+                from ..services.conversation_integration import get_complete_transcript, take_conversation_snapshot
+                from ..services.call_state_machine import create_state_machine
+                from ..services.call_termination_sequence import create_termination_sequence
                 
                 req_service = get_customer_requirement_service()
                 requirement_tools = get_requirement_tools_service()
                 lead_service = get_lead_storage_service()
+                conv_history_service = get_conversation_history_service()
                 
+                # Ensure state machine exists for this call
+                state_machine = create_state_machine(call_id)
+                
+                # Ensure termination sequence exists
+                term_seq = create_termination_sequence(call_id)
+
                 # Get collected requirements
                 requirements = None
                 if req_service:
                     requirements = await req_service.get_requirements(call_id)
-                    log.info(f"[CallHandler] ✅ Requirements fetched: {requirements}")
-                
-                # Build complete conversation text from all messages
-                conversation = session.get("conversation", [])
-                conversation_parts = []
-                detected_language = "en"
-                
-                for message in conversation:
-                    sender = message.get("sender", "unknown").upper()
-                    text = message.get("text", "")
-                    if text:
-                        conversation_parts.append(f"{sender}: {text}")
-                        
-                        # Detect language from first non-empty message
-                        from ..services.language_service import get_language_service
-                        lang_service = get_language_service()
-                        if lang_service and detected_language == "en":
-                            detected_language = lang_service.detect_language(text)
-                
-                full_conversation_text = "\n".join(conversation_parts)
-                
-                # 🔧 FIX: Save requirements even if conversation is empty
-                # (Gemini might have collected data but not logged it in conversation table)
-                if requirements:
-                    log.info(f"[CallHandler] 💾 Saving requirements to Google Sheets for {call_id}")
+                    if requirements:
+                        log.info(f"[CallHandler] ✅ Requirements fetched for {call_id}")
+
+                # Save requirements to Google Sheets (BEFORE database persistence)
+                if requirements and lead_service:
+                    log.info(f"[CallHandler] 💾 Saving requirements to Google Sheets")
                     result = await lead_service.save_requirements(requirements)
                     if result:
                         log.info(f"[CallHandler] ✅ Requirements saved to Google Sheets")
                     else:
-                        log.warning(f"[CallHandler] ⚠️ Failed to save requirements")
+                        log.warning(f"[CallHandler] ⚠️ Failed to save requirements to Google Sheets")
+
+                # Get complete conversation transcript
+                full_conversation_text = await get_complete_transcript(call_id)
+                
+                # Fallback to Redis session conversation if ConversationCaptureService empty
+                if not full_conversation_text:
+                    conversation = session.get("conversation", [])
+                    conversation_parts = []
+                    
+                    for message in conversation:
+                        sender = message.get("sender", "unknown").upper()
+                        text = message.get("text", "")
+                        if text:
+                            conversation_parts.append(f"{sender}: {text}")
+                    
+                    full_conversation_text = "\n".join(conversation_parts) if conversation_parts else ""
+
+                # Detect language
+                detected_language = session.get("response_language", "en")
+                if detected_language not in ["en-IN", "hi-IN", "en", "hi"]:
+                    detected_language = "en"
+
+                # Take immutable snapshot before persistence
+                snapshot = await take_conversation_snapshot(call_id)
+                if snapshot:
+                    log.info(
+                        f"[CallHandler] 📸 Conversation snapshot: {snapshot.get('total_messages')} messages"
+                    )
+
+                # Save conversation to database with idempotent protection
+                if full_conversation_text or snapshot:
+                    log.info(f"[CallHandler] 💾 Persisting conversation to database")
+                    
+                    persist_success = await term_seq.save_conversation_to_database(
+                        conversation_history_service=conv_history_service,
+                        userid=user_id,
+                        caller_number=caller_number,
+                        conversation_text=full_conversation_text or "",
+                        detected_language=detected_language,
+                        call_duration_sec=0  # TODO: Calculate from timestamps
+                    )
+
+                    if persist_success:
+                        log.info(f"[CallHandler] ✅ Conversation persisted to database")
+                    else:
+                        log.error(f"[CallHandler] ❌ Failed to persist conversation")
+                        # Continue with cleanup anyway
                 else:
-                    log.warning(f"[CallHandler] ⚠️ No requirements found for {call_id}")
-                
-                # Save conversation if exists
-                if full_conversation_text and full_conversation_text.strip():
-                    try:
-                        query = """
-                            INSERT INTO conversation_history 
-                            (call_id, participant_type, message_text, language, created_at)
-                            VALUES (%s, %s, %s, %s, %s)
-                        """
-                        await execute_insert(query, [
-                            call_id,
-                            "CONVERSATION",
-                            full_conversation_text[:5000],  # Limit length
-                            detected_language,
-                            datetime.utcnow()
-                        ])
-                        log.info(f"[CallHandler] ✅ Conversation saved to database")
-                    except Exception as e:
-                        log.warning(f"[CallHandler] Error saving conversation: {e}")
-                else:
-                    log.info(f"[CallHandler] ℹ️ No conversation text, skipping conversation save")
-                
-                # Cleanup requirements from Redis
-                if req_service:
-                    await req_service.cleanup_call(call_id)
-                    log.info(f"[CallHandler] ✅ Requirements cleaned up from Redis")
-                
+                    log.info(f"[CallHandler] ℹ️ No conversation data to save")
+
+                # Cleanup
+                try:
+                    # Cleanup requirements from Redis
+                    if req_service:
+                        await req_service.cleanup_call(call_id)
+                        log.info(f"[CallHandler] ✅ Requirements cleaned up from Redis")
+                    
+                    # Cleanup session from Redis
+                    await session_mgr.close_session(call_id)
+                    log.info(f"[CallHandler] ✅ Session cleaned up")
+                    
+                    # Cleanup state machine
+                    from ..services.call_state_machine import cleanup_state_machine
+                    cleanup_state_machine(call_id)
+                    
+                    # Cleanup termination sequence
+                    from ..services.call_termination_sequence import cleanup_termination_sequence
+                    cleanup_termination_sequence(call_id)
+                    
+                    # Cleanup conversation from memory
+                    from ..services.conversation_integration import cleanup_conversation
+                    await cleanup_conversation(call_id)
+                    
+                    log.info(f"[CallHandler] ✅ Call cleanup complete")
+
+                except Exception as e:
+                    log.warning(f"[CallHandler] Error in cleanup: {e}")
+
                 return True
 
             except Exception as e:

@@ -75,6 +75,14 @@ async def lifespan(app: FastAPI):
         # Initialize language service
         init_language_service()
 
+        # Initialize conversation capture service (CRITICAL: conversation history tracking)
+        try:
+            from app.services.conversation_capture_service import init_conversation_capture_service
+            await init_conversation_capture_service()
+            log.info("[STARTUP] ✓ Conversation capture service initialized (conversation history tracking)")
+        except Exception as e:
+            log.warning(f"[STARTUP] Conversation capture service initialization failed: {e}")
+
         # Initialize conversation services
         try:
             await init_conversation_service()

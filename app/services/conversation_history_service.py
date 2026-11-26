@@ -2,6 +2,13 @@
 Conversation History Service
 Handles database operations for conversation_history table
 Stores call conversations with minimal schema
+
+CRITICAL FEATURE: Exact one INSERT per call with idempotent protection.
+- Uses call_id as unique identifier
+- ON DUPLICATE KEY UPDATE prevents duplicates if retried
+- Parameterized queries prevent SQL injection
+- Transaction handling ensures atomicity
+- Database commit verified before success
 """
 
 import json
@@ -50,11 +57,17 @@ class ConversationHistoryService:
         """
         Save conversation data to conversation_history table
         
+        CRITICAL: Implements exact one INSERT per call with idempotent protection.
+        - ON DUPLICATE KEY UPDATE prevents duplicates if this method is called multiple times
+        - Each call_id can only have one record (unique constraint on call_id)
+        - Parameterized query prevents SQL injection
+        - Database transaction with explicit commit
+        
         Args:
-            call_id: Asterisk call identifier
+            call_id: Asterisk call identifier (unique key)
             userid: User ID
             caller_number: Caller phone number
-            conversation_text: Full conversation transcript
+            conversation_text: Full conversation transcript (AI + customer messages in order)
             detected_language: Language code (en, hi, etc.)
             call_duration: Duration in seconds
             call_arrived_time: When call arrived
@@ -87,40 +100,63 @@ class ConversationHistoryService:
             log.info(f"[ConvHistoryService]   ├─ Caller: {caller_number}")
             log.info(f"[ConvHistoryService]   ├─ Duration: {call_duration}s")
             log.info(f"[ConvHistoryService]   ├─ Language: {detected_language}")
-            log.info(f"[ConvHistoryService]   └─ Conversation size: {len(conversation_text)} chars")
+            log.info(f"[ConvHistoryService]   └─ Conversation: {len(conversation_text)} chars, {conversation_text.count(chr(10)) + 1} lines")
 
             db = get_sync_db()
             if not db:
                 log.error("[ConvHistoryService] Database connection failed")
                 return False
 
+            # CRITICAL: ON DUPLICATE KEY UPDATE for idempotent INSERT
+            # This ensures:
+            # 1. First call succeeds with INSERT
+            # 2. If retried, UPDATE only (no duplicate record)
+            # 3. call_id must be unique key in table
             query = """
             INSERT INTO conversation_history (
                 call_id, userid, caller_number, conversation_text, detected_language,
-                call_duration, call_arrived_time, call_start_time, call_end_time
+                call_duration, call_arrived_time, call_start_time, call_end_time, created_at
             ) VALUES (
                 %s, %s, %s, %s, %s,
-                %s, %s, %s, %s
+                %s, %s, %s, %s, %s
             )
             ON DUPLICATE KEY UPDATE
-                conversation_text = %s,
-                detected_language = %s,
-                call_duration = %s
+                conversation_text = VALUES(conversation_text),
+                detected_language = VALUES(detected_language),
+                call_duration = VALUES(call_duration),
+                call_end_time = VALUES(call_end_time)
             """
 
             params = (
-                call_id, userid, caller_number, conversation_text, detected_language,
-                call_duration, call_arrived_time, call_start_time, call_end_time,
-                conversation_text, detected_language, call_duration
+                call_id,
+                userid,
+                caller_number,
+                conversation_text,
+                detected_language,
+                call_duration,
+                call_arrived_time,
+                call_start_time,
+                call_end_time,
+                datetime.utcnow()
             )
 
             cursor = db.cursor()
-            cursor.execute(query, params)
-            db.commit()
-            cursor.close()
+            try:
+                # Execute parameterized query (SQL injection safe)
+                cursor.execute(query, params)
+                db.commit()  # Explicit commit required
 
-            log.info(f"[ConvHistoryService] ✅ Conversation saved successfully for call_id={call_id}")
-            return True
+                log.info(f"[ConvHistoryService] ✅ Conversation saved successfully for call_id={call_id}")
+                return True
+
+            except mysql.connector.Error as db_error:
+                db.rollback()  # Rollback on error
+                log.error(f"[ConvHistoryService] Database error: {db_error}")
+                return False
+
+            finally:
+                cursor.close()
+                db.close()
 
         except Exception as e:
             log.error(f"[ConvHistoryService] Save failed: {e}", exc_info=True)
