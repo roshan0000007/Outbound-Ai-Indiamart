@@ -215,46 +215,36 @@ async def handle_stasis_start(event: Dict[str, Any]) -> bool:
         except Exception as e:
             log.warning(f"[ARI] Failed to initialize requirements: {e}")
         
-        # ========== STEP 6: Ready for Language Selection via DTMF ==========
-        # ✅ FIX: Instead of trying to play a prompt before Gemini is ready,
-        # we simply signal that the system is ready for DTMF input.
-        # The 10-second timeout ensures the caller can proceed even if they don't
-        # hear an explicit prompt.
-        log.info(f"[ARI] 📢 Language selection ready for {call_id}")
-        log.info(f"[ARI]    ├─ Caller can press: 1 (English) or 2 (Hindi)")
-        log.info(f"[ARI]    ├─ Timeout: 10 seconds")
-        log.info(f"[ARI]    └─ Waiting for DTMF input...")
+        # ========== STEP 6: SET HINDI AS DEFAULT LANGUAGE ==========
+        # ✅ TEMPORARY FIX: Directly set Hindi language for all incoming calls
+        # This skips DTMF prompt and language selection
+        log.info(f"[ARI] 🌐 Setting default language: HINDI for {call_id}")
         
         try:
-            from ..services.greeting_service import get_greeting_service
-            greeting_service = get_greeting_service()
-            if greeting_service:
-                prompt_success = await greeting_service.play_language_selection_prompt_via_rtp(call_id)
-                if prompt_success:
-                    log.info(f"[ARI] ✅ Language selection ready")
-                    log.info(f"[ARI]    └─ Waiting for caller to press 1 or 2")
-                    # Give caller time to see the system is ready
-                    await asyncio.sleep(0.5)
-                else:
-                    log.warning(f"[ARI] ⚠️ Language prompt setup failed, continuing anyway")
-                    log.info(f"[ARI]    └─ Continuing: will use 10-second timeout for DTMF")
+            from ..services.gemini_audio_pipeline import get_gemini_audio_session
+            gemini_session = await get_gemini_audio_session(call_id)
+            if gemini_session:
+                # Set language to Hindi directly
+                gemini_session.set_call_language("hi")
+                log.info(f"[ARI] ✅ Language set to HINDI")
+                log.info(f"[ARI]    ├─ Skipping DTMF prompt")
+                log.info(f"[ARI]    ├─ Call will use Hindi greeting and questions")
+                log.info(f"[ARI]    └─ Greeting will play immediately in Hindi")
             else:
-                log.warning(f"[ARI] Greeting service not available")
+                log.warning(f"[ARI] Gemini session not found for language setting")
         except Exception as e:
-            log.warning(f"[ARI] Error preparing language selection: {e}")
-            log.info(f"[ARI]    └─ Continuing: will use 10-second timeout for DTMF")
+            log.warning(f"[ARI] Error setting default language: {e}")
         
-        # ========== STEP 7: Start listening (Gemini will wait for DTMF) ==========
-        # Gemini session initialization starts here
-        # It will call wait_for_language() which blocks until DTMF digit received
-        # Once DTMF is received, language_selected becomes True and:
-        #  - Audio input is released from gating (was dropping frames)
-        #  - Greeting is sent as first message to Gemini
-        #  - Conversation flow starts: greeting → questions → mobile → closing
-        log.info(f"[ARI] ⏳ Starting audio listening (waiting for DTMF 1 or 2)...")
-        log.info(f"[ARI]    ├─ Caller has 10 seconds to press a key")
-        log.info(f"[ARI]    ├─ Audio input is GATED (dropping frames) until language selected")
-        log.info(f"[ARI]    └─ Gemini session blocked in wait_for_language()")
+        
+        # ========== STEP 7: Start listening (Language is already set to Hindi) ==========
+        # Hindi has been pre-selected in Step 6
+        # Gemini session will NOT wait for DTMF - it will proceed directly to greeting
+        # Audio input is NOT gated - flowing to Gemini immediately
+        log.info(f"[ARI] ⏳ Starting audio listening (Hindi mode active)...")
+        log.info(f"[ARI]    ├─ Language: HINDI (pre-selected)")
+        log.info(f"[ARI]    ├─ No DTMF prompt - no waiting for digit")
+        log.info(f"[ARI]    ├─ Audio input is ACTIVE (not gated)")
+        log.info(f"[ARI]    └─ Gemini will start greeting immediately in Hindi")
         
         live_handler = get_live_call_handler()
         if live_handler:
@@ -262,31 +252,27 @@ async def handle_stasis_start(event: Dict[str, Any]) -> bool:
             if not listen_success:
                 log.warning(f"[ARI] Failed to start listening, but continuing call")
         
-        # ========== STEP 8: Gemini will start only after DTMF ==========
-        # Note: GeminiAudioSession.wait_for_language() blocks here until language is set by DTMF handler
-        # Audio input is gated (dropped) until language_selected = True
-        # Once DTMF digit is received in handle_channel_dtmf_received():
-        #   1. gemini_session.set_call_language(selected_language) is called
-        #   2. This sets language_selected = True and triggers _language_event
-        #   3. wait_for_language() returns, process_audio_stream() continues
-        #   4. Greeting is sent as first message to Gemini
-        #   5. Conversation starts with questions
+        # ========== STEP 8: Gemini starts immediately with Hindi greeting ==========
+        # No DTMF waiting - language is already set
+        # Greeting is sent as first message in Hindi
+        # Conversation starts with questions in Hindi
         
         log.info(f"[ARI] ✅✅✅ CALL ORCHESTRATION COMPLETE FOR {call_id}")
-        log.info(f"[ARI]    DTMF FLOW SUMMARY:")
-        log.info(f"[ARI]    ├─ [NOW] Prompt played: 'Press 1 (English) or 2 (Hindi)'")
-        log.info(f"[ARI]    ├─ [WAIT] Caller presses key → ARI triggers ChannelDtmfReceived")
-        log.info(f"[ARI]    ├─ [DTMF] Language set → Audio gating released")
-        log.info(f"[ARI]    ├─ [START] Greeting sent as first message to Gemini")
-        log.info(f"[ARI]    ├─ [CONV] Conversation flow: greeting → questions → mobile → closing")
+        log.info(f"[ARI]    CALL FLOW SUMMARY (HINDI MODE):")
+        log.info(f"[ARI]    ├─ [NOW] Language pre-set to HINDI")
+        log.info(f"[ARI]    ├─ [NOW] No DTMF prompt - no waiting")
+        log.info(f"[ARI]    ├─ [START] Greeting sent immediately in Hindi")
+        log.info(f"[ARI]    ├─ [CONV] Questions 1-7 in Hindi")
+        log.info(f"[ARI]    ├─ [CONV] Mobile number collection in Hindi")
+        log.info(f"[ARI]    ├─ [CONV] Closing message in Hindi")
         log.info(f"[ARI]    └─ [END] Call ends → Hangup and cleanup")
         log.info(f"[ARI]")
         log.info(f"[ARI]    TECHNICAL DETAILS:")
         log.info(f"[ARI]    ├─ Bridge ID: {bridge_id} (caller ↔ ExternalMedia bidirectional)")
         log.info(f"[ARI]    ├─ RTP endpoint: 163.223.186.31:{allocated_rtp_port}")
-        log.info(f"[ARI]    ├─ Gemini session language: awaiting DTMF input")
-        log.info(f"[ARI]    ├─ Audio input gate: ON (frames dropping until language selected)")
-        log.info(f"[ARI]    └─ Ready for DTMF input from caller")
+        log.info(f"[ARI]    ├─ Gemini session language: HINDI (pre-selected)")
+        log.info(f"[ARI]    ├─ Audio input gate: OFF (frames flowing to Gemini)")
+        log.info(f"[ARI]    └─ Ready to start greeting immediately")
 
         return True
 
