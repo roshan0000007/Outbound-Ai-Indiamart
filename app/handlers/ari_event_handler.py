@@ -215,26 +215,27 @@ async def handle_stasis_start(event: Dict[str, Any]) -> bool:
         except Exception as e:
             log.warning(f"[ARI] Failed to initialize requirements: {e}")
         
-        # ========== STEP 6: Play Language Selection Prompt via RTP ==========
-        # 🔧 CRITICAL: Use RTP for language prompt, NOT Asterisk playback (which has 404 issues)
-        # This prompt plays to the caller asking them to press 1 or 2 for language selection
-        log.info(f"[ARI] 📢 Playing language selection prompt via RTP for {call_id}")
+        # ========== STEP 6: Play Language Selection Prompt via Gemini Live ==========
+        # ✅ FIX: Use Gemini Live to synthesize DTMF prompt (not beep)
+        # Gemini will naturally say: "Press 1 for English, Press 2 for Hindi"
+        # This provides better audio quality and natural female voice
+        log.info(f"[ARI] 📢 Playing language selection prompt via Gemini Live for {call_id}")
         log.info(f"[ARI]    ├─ Prompt: 'Press 1 for English, 2 for Hindi'")
-        log.info(f"[ARI]    ├─ Format: mu-law 8kHz (G.711)")
-        log.info(f"[ARI]    └─ This audio plays to caller immediately via RTP TX")
+        log.info(f"[ARI]    ├─ Format: Gemini Live synthesized audio")
+        log.info(f"[ARI]    └─ This audio plays to caller immediately via Gemini")
         
         try:
             from ..services.greeting_service import get_greeting_service
             greeting_service = get_greeting_service()
             if greeting_service:
-                prompt_success = await greeting_service.play_language_selection_prompt_via_rtp(call_id)
+                prompt_success = await greeting_service.play_language_selection_prompt_via_gemini(call_id)
                 if prompt_success:
-                    log.info(f"[ARI] ✅ Language selection prompt sent via RTP")
+                    log.info(f"[ARI] ✅ Language selection prompt sent via Gemini Live")
                     log.info(f"[ARI]    └─ Caller now hears the language selection menu")
                     # Give caller time to hear and respond to the prompt
                     await asyncio.sleep(0.5)
                 else:
-                    log.warning(f"[ARI] ⚠️ Language prompt failed via RTP, continuing anyway")
+                    log.warning(f"[ARI] ⚠️ Language prompt failed via Gemini, continuing anyway")
                     log.info(f"[ARI]    └─ Continuing: will use 10-second timeout for DTMF")
             else:
                 log.warning(f"[ARI] Greeting service not available")

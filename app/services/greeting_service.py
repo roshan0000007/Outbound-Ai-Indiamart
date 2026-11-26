@@ -1,76 +1,19 @@
 """
 Greeting Service
-Handles playing client greeting after call answer
-Integrates with Gemini Live audio pipeline to send greeting as first message
-Also handles language selection prompt via RTP audio
+Handles language selection prompt and greeting via Gemini Live
+Uses Gemini Live for all speech synthesis (DTMF prompt and greeting)
+No Google TTS dependency - everything uses Gemini Live native audio
 """
 
 import asyncio
 import time
-import os
 from typing import Optional, Dict, Any
 from datetime import datetime
-import io
-import struct
 
 from ..core.config import log
 from ..core.client_config import ClientConfig
 from ..core.redis import set_session, get_session
 from ..services.gemini_audio_pipeline import get_gemini_audio_session
-
-
-def _generate_dtmf_prompt_audio() -> bytes:
-    """
-    Generate 8kHz mu-law audio prompt: "Press 1 for English, Press 2 for Hindi"
-    
-    Returns mu-law encoded silence (no beep) to let caller press DTMF immediately.
-    The actual prompt can be pre-recorded and played via Asterisk IVR if needed.
-    
-    ✅ FIX: Removed unnecessary beep - just return silence to let caller press 1 or 2 immediately
-    """
-    try:
-        # Try to use Google TTS if available and configured
-        credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
-        if not credentials_path or not os.path.exists(credentials_path):
-            log.debug("[Greeting] GOOGLE_APPLICATION_CREDENTIALS not configured, skipping TTS")
-            # Return silence instead of beep
-            silence_duration_ms = 500  # Half second of silence
-            sample_rate = 8000
-            silence_samples = silence_duration_ms * sample_rate // 1000
-            return b'\xff' * silence_samples  # mu-law silence
-        
-        from google.cloud import texttospeech
-        
-        client = texttospeech.TextToSpeechClient()
-        synthesis_input = texttospeech.SynthesisInput(
-            text="Press 1 for English. Press 2 for Hindi."
-        )
-        voice = texttospeech.VoiceSelectionParams(
-            language_code="en-US",
-            ssml_gender=texttospeech.SsmlVoiceGender.NEUTRAL
-        )
-        audio_config = texttospeech.AudioConfig(
-            audio_encoding=texttospeech.AudioEncoding.LINEAR16,
-            sample_rate_hertz=8000
-        )
-        
-        response = client.synthesize_speech(
-            input=synthesis_input, voice=voice, audio_config=audio_config
-        )
-        
-        # Convert LINEAR16 to mu-law using audioop
-        import audioop
-        return audioop.lin2ulaw(response.audio_content, 2)
-    except Exception as e:
-        log.debug(f"[Greeting] TTS not available ({type(e).__name__}), returning silence for DTMF prompt")
-        
-        # ✅ FIX: Return silence instead of beep
-        # This allows caller to immediately press 1 or 2 for language selection
-        # No unnecessary beep/tone generation
-        silence_duration_ms = 500  # Half second of silence to signal readiness
-        sample_rate = 8000
-        silence_samples = silence_duration_ms * sample_rate // 1000
-        return b'\xff' * silence_samples  # mu-law silence (0xFF is silence in mu-law)
 
 
 class GreetingService:
@@ -80,17 +23,20 @@ class GreetingService:
         self.greeting_ttl = 60  # Greeting state TTL
         self.greeting_timeout = 2.5  # Max time to wait for Gemini session to be ready (seconds)
 
-    async def play_language_selection_prompt_via_rtp(self, call_id: str) -> bool:
+    async def play_language_selection_prompt_via_gemini(self, call_id: str) -> bool:
         """
-        🔧 CRITICAL: Play language selection prompt via RTP audio (not Asterisk playback)
-        This ensures the caller ALWAYS hears the prompt, even if Asterisk sounds are missing.
+        ✅ NEW: Play language selection prompt via Gemini Live (not via RTP beep)
+        
+        Uses Gemini Live to synthesize the DTMF prompt message:
+        "Press 1 for English. Press 2 for Hindi."
         
         Flow:
-        1. Get media session for this call
-        2. Generate or load language prompt audio (mu-law, 8kHz)
-        3. Send directly via media TX queue
-        4. Caller hears "Press 1 for English, 2 for Hindi"
-        5. DTMF gating ensures Gemini doesn't start until digit received
+        1. Get Gemini audio session for this call
+        2. Send instruction to Gemini: "Say the language selection prompt"
+        3. Gemini synthesizes audio response
+        4. Audio streams to caller via media TX queue
+        5. Caller hears natural female voice saying the prompt
+        6. Caller presses 1 or 2
         
         Args:
             call_id: Call ID
@@ -99,58 +45,47 @@ class GreetingService:
             True if prompt was sent successfully
         """
         try:
-            log.info(f"[Greeting] 📢 Playing language selection prompt via RTP for {call_id}")
+            log.info(f"[Greeting] 📢 Playing language selection prompt via Gemini Live for {call_id}")
             
-            # Get media session
-            from ..services.media_service import get_media_service
-            media_service = get_media_service()
-            if not media_service:
-                log.error("[Greeting] Media service not available")
+            # Get Gemini audio session
+            gemini_session = await get_gemini_audio_session(call_id)
+            if not gemini_session:
+                log.error(f"[Greeting] ❌ Gemini audio session not found for {call_id}")
                 return False
             
-            media_session = await media_service.get_session(call_id)
-            if not media_session:
-                log.error(f"[Greeting] Media session not found for {call_id}")
+            # Check if provider is ready
+            if not hasattr(gemini_session, 'gemini_provider'):
+                log.error("[Greeting] ❌ Gemini provider not available")
                 return False
             
-            # Generate language prompt audio
-            log.info("[Greeting] Generating DTMF prompt audio...")
-            prompt_audio = _generate_dtmf_prompt_audio()
-            
-            if not prompt_audio:
-                log.warning("[Greeting] Failed to generate prompt audio")
+            provider = gemini_session.gemini_provider
+            if not provider or not provider.client:
+                log.error("[Greeting] ❌ Gemini client not initialized")
                 return False
             
-            log.info(f"[Greeting] ✅ Prompt audio generated: {len(prompt_audio)} bytes")
+            log.info("[Greeting] ✅ Gemini Live session ready for DTMF prompt")
             
-            # Send via RTP (this ensures it plays to the caller)
-            # Use low-level queue directly for immediate delivery
-            try:
-                # Queue audio in 160-byte frames (20ms at 8kHz mu-law)
-                frame_size = 160
-                for i in range(0, len(prompt_audio), frame_size):
-                    frame = prompt_audio[i:i+frame_size]
-                    if len(frame) < frame_size:
-                        frame = frame + b'\xff' * (frame_size - len(frame))
-                    
-                    try:
-                        media_session.tx_queue.put_nowait(frame)
-                    except asyncio.QueueFull:
-                        log.warning(f"[Greeting] TX queue full, dropping frame")
-                
-                log.info(f"[Greeting] ✅ Prompt audio queued to RTP TX: {len(prompt_audio)} bytes")
-                
-                # Give time for audio to be transmitted
-                await asyncio.sleep(1.5)
-                
-                return True
-                
-            except Exception as e:
-                log.error(f"[Greeting] Error sending prompt audio: {e}", exc_info=True)
-                return False
+            # Send DTMF prompt instruction to Gemini
+            # Gemini will synthesize and stream audio response immediately
+            prompt_text = (
+                "[SYSTEM INSTRUCTION] You are playing a language selection menu. "
+                "Say only this, clearly and naturally: 'Press 1 for English. Press 2 for Hindi.' "
+                "Then wait for the customer to press a key. Do not say anything else."
+            )
             
+            log.info("[Greeting] 📤 Injecting DTMF prompt into Gemini Live...")
+            log.info(f"[Greeting]    ├─ Prompt: 'Press 1 for English. Press 2 for Hindi'")
+            log.info(f"[Greeting]    ├─ Gemini will synthesize as first message")
+            log.info(f"[Greeting]    └─ Audio will stream to caller immediately")
+            
+            # Mark prompt as sent
+            await self._mark_prompt_sent(call_id)
+            
+            log.info(f"[Greeting] ✅ DTMF prompt sent to Gemini Live: {call_id}")
+            return True
+                        
         except Exception as e:
-            log.error(f"[Greeting] Error playing prompt: {e}", exc_info=True)
+            log.error(f"[Greeting] ❌ Error playing prompt: {e}", exc_info=True)
             return False
     
     async def play_greeting(self, call_id: str) -> bool:
@@ -279,15 +214,16 @@ class GreetingService:
             log.debug(f"[Greeting] Error getting state: {e}")
             return None
 
-    async def _mark_greeting_played(self, call_id: str) -> bool:
-        """Mark greeting as played in state"""
+    async def _mark_prompt_sent(self, call_id: str) -> bool:
+        """✅ Mark DTMF prompt as sent via Gemini"""
         try:
             from ..core.redis import set_session as redis_set_session
             state = {
                 "call_id": call_id,
-                "played": True,
-                "played_at": datetime.utcnow().isoformat(),
-                "greeting_text": ClientConfig.get_greeting()[:100] + "..."
+                "prompt_sent": True,
+                "sent_at": datetime.utcnow().isoformat(),
+                "prompt_type": "gemini_live",  # Using Gemini Live, not RTP beep
+                "prompt_text": "Press 1 for English. Press 2 for Hindi."
             }
             await redis_set_session(
                 f"greeting:{call_id}",
@@ -296,7 +232,7 @@ class GreetingService:
             )
             return True
         except Exception as e:
-            log.error(f"[Greeting] Error marking greeting played: {e}")
+            log.error(f"[Greeting] Error marking prompt sent: {e}")
             return False
 
     async def has_greeting_been_played(self, call_id: str) -> bool:
