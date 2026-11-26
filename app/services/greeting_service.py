@@ -7,6 +7,7 @@ Also handles language selection prompt via RTP audio
 
 import asyncio
 import time
+import os
 from typing import Optional, Dict, Any
 from datetime import datetime
 import io
@@ -20,12 +21,24 @@ from ..services.gemini_audio_pipeline import get_gemini_audio_session
 
 def _generate_dtmf_prompt_audio() -> bytes:
     """
-    Generate simple 8kHz mu-law audio prompt: "Press 1 for English, Press 2 for Hindi"
-    If TTS is not available, returns a beep sequence as fallback
+    Generate 8kHz mu-law audio prompt: "Press 1 for English, Press 2 for Hindi"
+    
+    Returns mu-law encoded silence (no beep) to let caller press DTMF immediately.
+    The actual prompt can be pre-recorded and played via Asterisk IVR if needed.
+    
+    ✅ FIX: Removed unnecessary beep - just return silence to let caller press 1 or 2 immediately
     """
     try:
-        # Try to use Google TTS if available
-        import threading
+        # Try to use Google TTS if available and configured
+        credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+        if not credentials_path or not os.path.exists(credentials_path):
+            log.debug("[Greeting] GOOGLE_APPLICATION_CREDENTIALS not configured, skipping TTS")
+            # Return silence instead of beep
+            silence_duration_ms = 500  # Half second of silence
+            sample_rate = 8000
+            silence_samples = silence_duration_ms * sample_rate // 1000
+            return b'\xff' * silence_samples  # mu-law silence
+        
         from google.cloud import texttospeech
         
         client = texttospeech.TextToSpeechClient()
@@ -49,31 +62,15 @@ def _generate_dtmf_prompt_audio() -> bytes:
         import audioop
         return audioop.lin2ulaw(response.audio_content, 2)
     except Exception as e:
-        log.debug(f"[Greeting] TTS unavailable, using fallback beep sequence: {e}")
+        log.debug(f"[Greeting] TTS not available ({type(e).__name__}), returning silence for DTMF prompt")
         
-        # Fallback: Generate simple beep sequence (1000Hz tone, 200ms, repeated)
-        # This is a placeholder; in production, use a pre-recorded file
+        # ✅ FIX: Return silence instead of beep
+        # This allows caller to immediately press 1 or 2 for language selection
+        # No unnecessary beep/tone generation
+        silence_duration_ms = 500  # Half second of silence to signal readiness
         sample_rate = 8000
-        duration_ms = 1000
-        frequency = 1000
-        
-        samples = []
-        num_samples = int(sample_rate * duration_ms / 1000)
-        for i in range(num_samples):
-            # Generate sine wave
-            angle = 2.0 * 3.14159 * frequency * i / sample_rate
-            sample = int(32767 * 0.5 * (1 + __import__('math').sin(angle)))
-            samples.append(sample)
-        
-        # Convert to bytes and then to mu-law
-        audio_bytes = struct.pack('<' + 'h' * len(samples), *samples)
-        import audioop
-        try:
-            return audioop.lin2ulaw(audio_bytes, 2)
-        except:
-            # Last resort: return silence
-            log.warning("[Greeting] Could not generate audio prompt")
-            return b'\xff' * (sample_rate * duration_ms // 1000)
+        silence_samples = silence_duration_ms * sample_rate // 1000
+        return b'\xff' * silence_samples  # mu-law silence (0xFF is silence in mu-law)
 
 
 class GreetingService:
