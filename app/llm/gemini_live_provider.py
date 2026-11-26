@@ -256,9 +256,15 @@ class GeminiLiveProvider:
                 on_ulaw_chunk(ulaw)
 
         def next_unanswered_index() -> Optional[int]:
+            unanswered = []
             for i, q in enumerate(REQUIRED_QUESTIONS):
                 if q["key"] not in answered:
-                    return i
+                    unanswered.append(f"{i}:{q['key']}")
+            if unanswered:
+                log.debug(f"[Gemini Live] Unanswered: {', '.join(unanswered)}")
+                return int(unanswered[0].split(':')[0])
+            log.info(f"[Gemini Live] ✅ ALL QUESTIONS COMPLETE - Total answered: {len(answered)}/{len(REQUIRED_QUESTIONS)}")
+            log.info(f"[Gemini Live] Answered fields: {sorted(list(answered))}")
             return None
 
         async def send_instruction(live, text: str):
@@ -311,7 +317,7 @@ class GeminiLiveProvider:
                     
                     answered.add(field)
                     stats["saved"] += 1
-                    log.info(f"[Gemini Live] ✅ Saved {field} = '{value}'")
+                    log.info(f"[Gemini Live] ✅ Saved {field} = '{value}' ({len(answered)}/{len(REQUIRED_QUESTIONS)} total)")
                     if on_field_saved:
                         try:
                             on_field_saved(field, value)
@@ -333,10 +339,14 @@ class GeminiLiveProvider:
             nxt = next_unanswered_index()
             if nxt is None:
                 # All questions answered
+                log.info(f"[Gemini Live] nxt = None, checking if closing_sent={state['closing_sent']}")
                 if not state["closing_sent"]:
                     state["closing_sent"] = True
-                    log.info(f"[Gemini Live] ✅ All {len(answered)} details collected; sending closing")
+                    log.info(f"[Gemini Live] ✅ All {len(answered)} details collected; sending closing instruction")
                     await send_instruction(live, closing_instruction(lang))
+                    log.info(f"[Gemini Live] Closing instruction sent, waiting for turn_complete to trigger on_call_complete")
+                else:
+                    log.warning(f"[Gemini Live] nxt=None but closing_sent already True (should not reach here)")
             elif not state["greeting_pending"] and nxt != state["question_asked"]:
                 # More questions to ask
                 log.info(f"[Gemini Live] Moving to next question: {nxt + 1}/{len(REQUIRED_QUESTIONS)}")
@@ -403,7 +413,7 @@ class GeminiLiveProvider:
 
                             if sc.turn_complete:
                                 stats["turns"] += 1
-                                log.info(f"[Gemini Live] Turn {stats['turns']} complete")
+                                log.info(f"[Gemini Live] Turn {stats['turns']} complete (greeting_pending={state['greeting_pending']}, closing_sent={state['closing_sent']})")
 
                                 if state["greeting_pending"]:
                                     # ✅ STEP 1: Greeting finished → Ask first question
@@ -413,7 +423,7 @@ class GeminiLiveProvider:
                                     
                                 elif state["closing_sent"]:
                                     # ✅ STEP FINAL: Closing finished → End call
-                                    log.info("[Gemini Live] Closing message finished")
+                                    log.info("[Gemini Live] ✅ Closing message finished, triggering on_call_complete")
                                     if on_call_complete:
                                         try:
                                             on_call_complete()
@@ -436,9 +446,26 @@ class GeminiLiveProvider:
                 recv_task = asyncio.create_task(receive_audio())
                 end_task = asyncio.create_task(closing_done.wait())
                 try:
-                    # The call ends when the caller hangs up, the closing finishes, or the stream drops
-                    await asyncio.wait({send_task, recv_task, end_task},
-                                       return_when=asyncio.FIRST_COMPLETED)
+                    # The call ends when: (1) closing finishes, (2) caller hangs up during questions, or (3) stream drops
+                    # CRITICAL: If closing_sent is True, we MUST wait for end_task (closing completion) even if send_task ends
+                    if state.get("closing_sent"):
+                        # Closing is in progress - prioritize completion
+                        done, pending = await asyncio.wait(
+                            {send_task, recv_task, end_task},
+                            return_when=asyncio.FIRST_COMPLETED
+                        )
+                        # If closing finished, end_task is done, so we're good
+                        # If send_task ended (caller hung up) but closing NOT done, give it a few more seconds
+                        if end_task not in done:
+                            log.warning("[Gemini Live] Caller hung up during closing playback; waiting max 3s for closing to complete")
+                            try:
+                                await asyncio.wait_for(end_task, timeout=3.0)
+                            except asyncio.TimeoutError:
+                                log.error("[Gemini Live] Closing did not complete within 3s timeout")
+                    else:
+                        # Normal flow - wait for first completion
+                        await asyncio.wait({send_task, recv_task, end_task},
+                                           return_when=asyncio.FIRST_COMPLETED)
                 finally:
                     for t in (send_task, recv_task, end_task):
                         t.cancel()

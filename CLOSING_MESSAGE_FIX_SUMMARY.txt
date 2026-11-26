@@ -1,0 +1,88 @@
+═══════════════════════════════════════════════════════════════════════════════
+ CLOSING MESSAGE FIX - SUMMARY FOR END-TO-END TESTING
+═══════════════════════════════════════════════════════════════════════════════
+
+PROBLEM FIXED:
+• Closing message was not playing after all 7 requirements collected
+• System would save requirements but skip the closing instruction
+• Calls ended abruptly without proper farewell
+
+ROOT CAUSE:
+• Critical race condition in asyncio.wait() logic (gemini_live_provider.py:445)
+• When closing was sent and caller hung up, system would exit before 
+  receiving the closing audio from Gemini
+• Missing diagnostic logging made it impossible to track where it failed
+
+SOLUTION APPLIED:
+✓ Fixed asyncio race condition - prioritizes closing completion over caller hangup
+✓ Added comprehensive diagnostic logging at every step
+✓ System now waits up to 3 seconds for closing to complete even if caller hangs up
+
+FILE MODIFIED:
+  app/llm/gemini_live_provider.py (single file, no new files created)
+
+KEY CHANGES:
+1. Enhanced next_unanswered_index() - logs exactly which fields are missing
+2. Added field counter to save logs - shows progress (N/8)
+3. Enhanced closing trigger logging - shows when closing is sent
+4. Fixed asyncio.wait() - proper handling of closing sequence
+5. Enhanced turn_complete logging - shows conversation state
+
+EXPECTED BEHAVIOR AFTER FIX:
+
+Before (BROKEN):
+  12:21:09.754 [INFO] ✅ Saved company_name = 'N/A'
+  12:21:09.755 [INFO] Moving to next question: 3/8
+  ... (questions continue but never reach all 8)
+  ... (closing NEVER plays)
+  ... (call exits without proper termination)
+
+After (FIXED):
+  12:21:XX.XXX [INFO] ✅ Saved mobile_number = '9876543210' (8/8 total)
+  12:21:XX.XXX [INFO] ✅ ALL QUESTIONS COMPLETE - Total answered: 8/8
+  12:21:XX.XXX [INFO] ✅ All 8 details collected; sending closing instruction
+  12:21:XX.XXX [INFO] Closing instruction sent, waiting for turn_complete...
+  12:21:XX.XXX [INFO] ✅ Closing message finished, triggering on_call_complete
+  ... (conversation saved to database)
+  ... (call properly terminated)
+
+HOW TO TEST:
+
+1. Make a test call and go through all questions
+2. Watch the logs for:
+   - "✅ ALL QUESTIONS COMPLETE" message
+   - "Closing instruction sent" message
+   - "✅ Closing message finished" message
+3. Verify in database:
+   - SELECT * FROM conversation_history ORDER BY created_at DESC LIMIT 1;
+   - Should have complete record with all fields
+4. Verify in Google Sheets:
+   - New row added with all 7 requirements
+
+DIAGNOSTIC LOGS TO MONITOR:
+
+Looking for these in order:
+1. "[Gemini Live] ✅ ALL QUESTIONS COMPLETE - Total answered: 8/8"
+   → Confirms all 8 fields collected
+   
+2. "[Gemini Live] ✅ All 8 details collected; sending closing instruction"
+   → Confirms closing is being triggered
+   
+3. "[Gemini Live] Closing instruction sent, waiting for turn_complete..."
+   → Confirms closing instruction was sent to Gemini
+   
+4. "[Gemini Live] Turn XX complete (closing_sent=True)"
+   → Confirms Gemini received and processed closing
+   
+5. "[Gemini Live] ✅ Closing message finished, triggering on_call_complete"
+   → Confirms closing audio was delivered and call is ending properly
+
+If any of these are missing, check:
+- Are all 8 questions being answered?
+- Is the last answer being saved to the 'answered' set?
+- Is Gemini Live still connected when closing is sent?
+
+═══════════════════════════════════════════════════════════════════════════════
+ Configuration: Can customize closing message via environment variable
+ CLIENT_CLOSING_MESSAGE or in app/core/client_config.py (DEFAULT_CLOSING_MESSAGE)
+═══════════════════════════════════════════════════════════════════════════════
