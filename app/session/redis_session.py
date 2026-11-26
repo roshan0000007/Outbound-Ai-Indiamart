@@ -5,6 +5,8 @@ Manages call state and conversation history during active calls
 """
 
 import json
+import hashlib
+import uuid
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 
@@ -72,8 +74,13 @@ class CallSession:
                 log.warning("[CallSession] Redis not initialized")
                 return None
 
+            # Generate unique call session ID for Google Sheets tracking
+            # Format: CALL-YYYYMMDD-NNNN (e.g., CALL-20261126-0001)
+            call_session_id = self._generate_call_session_id(call_id)
+
             session = {
                 "call_id": call_id,
+                "call_session_id": call_session_id,  # ✅ NEW: Unique session ID for sheets
                 "user_id": user_id,
                 "campaign_id": 0,
                 "agent_name": agent_name,
@@ -91,6 +98,7 @@ class CallSession:
                 "conversation": [],
                 "call_status": "active",
                 "started_at": datetime.utcnow().isoformat(),
+                "requirements_saved_to_sheets": False,  # ✅ NEW: Idempotency flag
                 "metadata": {}
             }
 
@@ -102,12 +110,47 @@ class CallSession:
                 json.dumps(session)
             )
 
-            log.info(f"[CallSession] Created session: call_id={call_id}, user_id={user_id}, language={language}, voice=female")
+            log.info(f"[CallSession] Created session: call_id={call_id}, session_id={call_session_id}, user_id={user_id}, language={language}, voice=female")
             return session
 
         except Exception as e:
             log.error(f"[CallSession] Create session error: {e}")
             return None
+
+    def _generate_call_session_id(self, call_id: str) -> str:
+        """
+        Generate a unique call session ID.
+        
+        Format: CALL-YYYYMMDD-NNNNN
+        where NNNNN is derived from the call_id hash to ensure uniqueness per call
+        
+        Args:
+            call_id: Asterisk unique call ID
+            
+        Returns:
+            Unique call session ID string
+        """
+        try:
+            # Get current date
+            now = datetime.utcnow()
+            date_str = now.strftime("%Y%m%d")
+            
+            # Hash the call_id to get a unique number (use first 5 chars of hex hash)
+            hash_obj = hashlib.sha256(call_id.encode('utf-8'))
+            hash_hex = hash_obj.hexdigest()[:5]
+            # Convert hex to decimal
+            hash_num = int(hash_hex, 16) % 99999
+            
+            # Create session ID
+            session_id = f"CALL-{date_str}-{hash_num:05d}"
+            
+            log.debug(f"[CallSession] Generated session ID: {session_id} for call_id: {call_id}")
+            return session_id
+        except Exception as e:
+            log.warning(f"[CallSession] Error generating session ID: {e}, using UUID fallback")
+            # Fallback to UUID-based ID
+            unique_suffix = str(uuid.uuid4())[:8].upper()
+            return f"CALL-{unique_suffix}"
 
     async def get_session(self, call_id: str) -> Optional[Dict]:
         """

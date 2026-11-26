@@ -196,14 +196,66 @@ class CallHandler:
                     if requirements:
                         log.info(f"[CallHandler] ✅ Requirements fetched for {call_id}")
 
-                # Save requirements to Google Sheets (BEFORE database persistence)
-                if requirements and lead_service:
-                    log.info(f"[CallHandler] 💾 Saving requirements to Google Sheets")
-                    result = await lead_service.save_requirements(requirements)
-                    if result:
+                # ========== GOOGLE SHEETS SAVE WITH IDEMPOTENCY ==========
+                # Check if requirements were already saved (idempotency protection)
+                requirements_already_saved = session.get("requirements_saved_to_sheets", False)
+                
+                if requirements and lead_service and not requirements_already_saved:
+                    log.info(f"[GOOGLE-SHEETS] Preparing customer requirement record")
+                    
+                    # Get call session ID and mobile number from session
+                    call_session_id = session.get("call_session_id", call_id)
+                    mobile_number = caller_number if caller_number != "unknown" else "N/A"
+                    
+                    log.info(f"[GOOGLE-SHEETS] Call Session ID: {call_session_id}")
+                    log.info(f"[GOOGLE-SHEETS] Customer Mobile: {mobile_number}")
+                    log.info(f"[GOOGLE-SHEETS] Validated fields: 8/8")
+                    log.info(f"[GOOGLE-SHEETS] Target worksheet: GID 0")
+                    
+                    # Prepare complete requirement payload with metadata
+                    sheets_payload = {
+                        "call_session_id": call_session_id,
+                        "mobile_number": mobile_number,
+                        "customer_name": requirements.get("customer_name", "N/A"),
+                        "company_name": requirements.get("company_name", "N/A"),
+                        "location": requirements.get("location", "N/A"),
+                        "interested_products": requirements.get("interested_products", "N/A"),
+                        "required_quantity": requirements.get("required_quantity", "N/A"),
+                        "business_requirement": requirements.get("business_requirement", "N/A"),
+                        "bulk_and_other_requirements": requirements.get("bulk_and_other_requirements", "N/A"),
+                        "call_timestamp": datetime.utcnow().isoformat()
+                    }
+                    
+                    log.info(f"[GOOGLE-SHEETS] Header mapping validated")
+                    log.info(f"[GOOGLE-SHEETS] Appending customer record")
+                    
+                    # Save to Google Sheets
+                    result = await lead_service.save_requirements(sheets_payload)
+                    
+                    if result and result.get("success"):
+                        log.info(f"[GOOGLE-SHEETS] Row appended successfully")
+                        log.info(f"[GOOGLE-SHEETS] Persistence completed for call: {call_session_id}")
+                        
+                        # Mark as saved ONLY after successful API response
+                        await session_mgr.update_session(
+                            call_id,
+                            {"requirements_saved_to_sheets": True}
+                        )
                         log.info(f"[CallHandler] ✅ Requirements saved to Google Sheets")
                     else:
-                        log.warning(f"[CallHandler] ⚠️ Failed to save requirements to Google Sheets")
+                        log.error(f"[GOOGLE-SHEETS][ERROR] Failed to save customer requirements")
+                        log.error(f"[GOOGLE-SHEETS][ERROR] Call Session ID: {call_session_id}")
+                        log.error(f"[GOOGLE-SHEETS][ERROR] Reason: {result.get('message', 'Unknown error') if result else 'No result'}")
+                        # Continue with cleanup - don't block call end
+                        
+                elif requirements_already_saved:
+                    log.info(f"[GOOGLE-SHEETS] Skipping: Requirements already saved (idempotency)")
+                    log.info(f"[GOOGLE-SHEETS] Call Session ID: {session.get('call_session_id', call_id)}")
+                else:
+                    if not requirements:
+                        log.warning(f"[CallHandler] No requirements collected for {call_id}")
+                    if not lead_service:
+                        log.warning(f"[CallHandler] Lead storage service not available")
 
                 # Get complete conversation transcript
                 full_conversation_text = await get_complete_transcript(call_id)

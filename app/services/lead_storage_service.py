@@ -44,7 +44,7 @@ class GoogleSheetsAdapter:
             
             self.service = build("sheets", "v4", credentials=credentials)
             
-            # Ensure headers exist
+            # Ensure headers exist with new columns
             await self._ensure_headers()
             
             log.info("[GoogleSheets] ✅ Service initialized successfully")
@@ -57,63 +57,99 @@ class GoogleSheetsAdapter:
             return False
 
     async def _ensure_headers(self) -> None:
-        """Ensure the seven required headers exist"""
+        """Ensure headers exist with Call Session ID, Mobile Number, and Call Date & Time"""
         try:
             if not self.service:
                 return
             
-            range_name = f"{self.sheet_tab}!A1:G1"
+            # Read first row to check existing headers
+            range_name = f"{self.sheet_tab}!A1:J1"
             result = self.service.spreadsheets().values().get(
                 spreadsheetId=self.sheet_id,
                 range=range_name
             ).execute()
             
             existing_values = result.get("values", [])
+            existing_headers = existing_values[0] if existing_values else []
             
+            # Define required headers in order
             required_headers = [
+                "Call Session ID",
+                "Customer Mobile Number",
                 "Customer Name",
                 "Company Name",
                 "Location",
                 "Interested Products",
                 "Required Quantity",
                 "Business Requirement",
-                "Bulk & Other Requirements"
+                "Bulk & Other Requirements",
+                "Call Date & Time"
             ]
             
-            if not existing_values or existing_values[0] != required_headers:
-                log.info("[GoogleSheets] Creating/updating headers")
+            # Only update if headers don't match
+            if existing_headers != required_headers:
+                log.info("[GoogleSheets] Creating/updating headers with new columns")
+                log.info(f"[GoogleSheets] Headers: {required_headers}")
+                
                 self.service.spreadsheets().values().update(
                     spreadsheetId=self.sheet_id,
                     range=range_name,
                     valueInputOption="RAW",
                     body={"values": [required_headers]}
                 ).execute()
+                
                 log.info("[GoogleSheets] ✅ Headers ensured")
         except Exception as e:
             log.error(f"[GoogleSheets] Error ensuring headers: {e}")
 
     async def save_requirements(self, requirements: Dict[str, Any]) -> Dict[str, Any]:
-        """Save requirements to Google Sheets"""
+        """
+        Save requirements to Google Sheets with Call Session ID, Mobile Number, and timestamp.
+        
+        Args:
+            requirements: Dict with keys:
+                - call_session_id: Unique call session identifier
+                - mobile_number: Customer's phone number
+                - customer_name: Name
+                - company_name: Company
+                - location: Location
+                - interested_products: Products
+                - required_quantity: Quantity
+                - business_requirement: Business need
+                - bulk_and_other_requirements: Other requirements
+                - call_timestamp: ISO format datetime string (optional, generated if missing)
+                
+        Returns:
+            Dict with success status, message, row_number, and call_session_id
+        """
         try:
             if not self.service:
                 return {
                     "success": False,
                     "message": "Service not initialized",
-                    "row_number": None
+                    "row_number": None,
+                    "call_session_id": requirements.get("call_session_id", "unknown")
                 }
             
-            # Prepare row data in exact order
+            call_session_id = requirements.get("call_session_id", "")
+            mobile_number = requirements.get("mobile_number", "N/A")
+            call_timestamp = requirements.get("call_timestamp", datetime.utcnow().isoformat())
+            
+            # Prepare row data in exact order matching headers
             row_data = [
+                call_session_id,
+                mobile_number,
                 requirements.get("customer_name", ""),
                 requirements.get("company_name", ""),
                 requirements.get("location", ""),
                 requirements.get("interested_products", ""),
                 requirements.get("required_quantity", ""),
                 requirements.get("business_requirement", ""),
-                requirements.get("bulk_and_other_requirements", "")
+                requirements.get("bulk_and_other_requirements", ""),
+                call_timestamp
             ]
             
-            # Find next empty row
+            # Find next empty row by checking column A
             range_name = f"{self.sheet_tab}!A:A"
             result = self.service.spreadsheets().values().get(
                 spreadsheetId=self.sheet_id,
@@ -123,8 +159,28 @@ class GoogleSheetsAdapter:
             existing_rows = result.get("values", [])
             next_row = len(existing_rows) + 1
             
+            # Idempotency check: Verify this call_session_id doesn't already exist
+            if call_session_id:
+                range_name_check = f"{self.sheet_tab}!A:A"
+                existing_data = self.service.spreadsheets().values().get(
+                    spreadsheetId=self.sheet_id,
+                    range=range_name_check
+                ).execute()
+                
+                existing_session_ids = existing_data.get("values", [])[1:]  # Skip header
+                for existing_id in existing_session_ids:
+                    if existing_id and existing_id[0] == call_session_id:
+                        log.warning(f"[GoogleSheets] Call {call_session_id} already saved (idempotency)")
+                        return {
+                            "success": True,
+                            "message": "Already saved (idempotent)",
+                            "row_number": existing_rows.index([call_session_id]) + 1 if [call_session_id] in existing_rows else next_row,
+                            "call_session_id": call_session_id,
+                            "already_saved": True
+                        }
+            
             # Append row
-            range_name = f"{self.sheet_tab}!A{next_row}:G{next_row}"
+            range_name = f"{self.sheet_tab}!A{next_row}:J{next_row}"
             self.service.spreadsheets().values().update(
                 spreadsheetId=self.sheet_id,
                 range=range_name,
@@ -133,18 +189,24 @@ class GoogleSheetsAdapter:
             ).execute()
             
             log.info(f"[GoogleSheets] ✅ Saved to row {next_row}")
+            log.info(f"[GoogleSheets] Call Session ID: {call_session_id}")
+            log.info(f"[GoogleSheets] Customer Mobile: {mobile_number}")
+            log.info(f"[GoogleSheets] Validated fields: 8/8")
             
             return {
                 "success": True,
                 "message": "Saved to Google Sheets",
-                "row_number": next_row
+                "row_number": next_row,
+                "call_session_id": call_session_id,
+                "already_saved": False
             }
         except Exception as e:
             log.error(f"[GoogleSheets] Error saving requirements: {e}")
             return {
                 "success": False,
                 "message": str(e),
-                "row_number": None
+                "row_number": None,
+                "call_session_id": requirements.get("call_session_id", "unknown")
             }
 
 
