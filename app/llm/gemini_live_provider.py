@@ -117,7 +117,8 @@ class GeminiLiveProvider:
         self.api_key = os.getenv("GEMINI_API_KEY", "")
         self.model = os.getenv("GEMINI_LIVE_MODEL", "gemini-2.0-flash-live-001")
         self.text_model = os.getenv("GEMINI_TEXT_MODEL", "gemini-2.5-flash")
-        self.voice = os.getenv("GEMINI_VOICE", "Kore")
+        # ✅ Changed from "Kore" to "Aoede" for natural female Indian voice
+        self.voice = os.getenv("GEMINI_VOICE", "Aoede")
         self.temperature = float(os.getenv("LLM_TEMPERATURE", "0.3"))
         self.max_tokens = int(os.getenv("LLM_MAX_TOKENS", "500"))
 
@@ -277,7 +278,37 @@ class GeminiLiveProvider:
                 args = dict(fc.args or {})
                 field = str(args.get("field", "")).strip()
                 value = str(args.get("value", "")).strip()
+                
+                # ✅ ENHANCED: Response validation and N/A handling
                 if fc.name == "record_answer" and field in RECORD_FIELDS and value:
+                    # Check for refusal patterns
+                    refusal_patterns = [
+                        "n/a", "na", "don't know", "dont know", "don't have", "dont have",
+                        "not provided", "prefer not", "won't provide", "don't want to share",
+                        "not interested", "not applicable", "नहीं पता", "नहीं बता सकता",
+                        "नहीं दे सकता", "पता नहीं", "नहीं दूँगा", "नहीं दूंगा"
+                    ]
+                    
+                    value_lower = value.lower()
+                    is_refusal = any(pattern in value_lower for pattern in refusal_patterns)
+                    
+                    if is_refusal:
+                        value = "N/A"
+                        log.info(f"[Gemini Live] Refusal detected and marked N/A: {field}")
+                    
+                    # ✅ ENHANCED: Validate response completeness
+                    # For fields requiring multiple words (name, company, location), check length
+                    if field in ["customer_name", "company_name", "location"]:
+                        word_count = len(value.split())
+                        if word_count == 0 or (word_count == 1 and len(value) < 2):
+                            # Likely incomplete or just "yes/no" - trigger clarification
+                            log.warning(f"[Gemini Live] Response too brief for {field}: {value}")
+                            status = "rejected: response too brief, needs clarification"
+                            responses.append(types.FunctionResponse(
+                                id=fc.id, name=fc.name, response={"result": status},
+                            ))
+                            continue
+                    
                     answered.add(field)
                     stats["saved"] += 1
                     log.info(f"[Gemini Live] Saved {field} = {value}")
@@ -289,6 +320,9 @@ class GeminiLiveProvider:
                     status = "saved"
                 else:
                     status = "rejected: unknown field or empty value"
+                    if not value:
+                        log.info(f"[Gemini Live] Empty response for {field} - requesting clarification")
+                
                 responses.append(types.FunctionResponse(
                     id=fc.id, name=fc.name, response={"result": status},
                 ))
