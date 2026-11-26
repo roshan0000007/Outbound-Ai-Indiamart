@@ -217,7 +217,12 @@ async def handle_stasis_start(event: Dict[str, Any]) -> bool:
         
         # ========== STEP 6: Play Language Selection Prompt via RTP ==========
         # 🔧 CRITICAL: Use RTP for language prompt, NOT Asterisk playback (which has 404 issues)
+        # This prompt plays to the caller asking them to press 1 or 2 for language selection
         log.info(f"[ARI] 📢 Playing language selection prompt via RTP for {call_id}")
+        log.info(f"[ARI]    ├─ Prompt: 'Press 1 for English, 2 for Hindi'")
+        log.info(f"[ARI]    ├─ Format: mu-law 8kHz (G.711)")
+        log.info(f"[ARI]    └─ This audio plays to caller immediately via RTP TX")
+        
         try:
             from ..services.greeting_service import get_greeting_service
             greeting_service = get_greeting_service()
@@ -225,19 +230,29 @@ async def handle_stasis_start(event: Dict[str, Any]) -> bool:
                 prompt_success = await greeting_service.play_language_selection_prompt_via_rtp(call_id)
                 if prompt_success:
                     log.info(f"[ARI] ✅ Language selection prompt sent via RTP")
-                    # Give caller time to hear and respond
+                    log.info(f"[ARI]    └─ Caller now hears the language selection menu")
+                    # Give caller time to hear and respond to the prompt
                     await asyncio.sleep(0.5)
                 else:
                     log.warning(f"[ARI] ⚠️ Language prompt failed via RTP, continuing anyway")
+                    log.info(f"[ARI]    └─ Continuing: will use 10-second timeout for DTMF")
             else:
                 log.warning(f"[ARI] Greeting service not available")
         except Exception as e:
             log.warning(f"[ARI] Error playing language prompt: {e}")
+            log.info(f"[ARI]    └─ Continuing: will use 10-second timeout for DTMF")
         
         # ========== STEP 7: Start listening (Gemini will wait for DTMF) ==========
         # Gemini session initialization starts here
         # It will call wait_for_language() which blocks until DTMF digit received
+        # Once DTMF is received, language_selected becomes True and:
+        #  - Audio input is released from gating (was dropping frames)
+        #  - Greeting is sent as first message to Gemini
+        #  - Conversation flow starts: greeting → questions → mobile → closing
         log.info(f"[ARI] ⏳ Starting audio listening (waiting for DTMF 1 or 2)...")
+        log.info(f"[ARI]    ├─ Caller has 10 seconds to press a key")
+        log.info(f"[ARI]    ├─ Audio input is GATED (dropping frames) until language selected")
+        log.info(f"[ARI]    └─ Gemini session blocked in wait_for_language()")
         
         live_handler = get_live_call_handler()
         if live_handler:
@@ -248,13 +263,28 @@ async def handle_stasis_start(event: Dict[str, Any]) -> bool:
         # ========== STEP 8: Gemini will start only after DTMF ==========
         # Note: GeminiAudioSession.wait_for_language() blocks here until language is set by DTMF handler
         # Audio input is gated (dropped) until language_selected = True
+        # Once DTMF digit is received in handle_channel_dtmf_received():
+        #   1. gemini_session.set_call_language(selected_language) is called
+        #   2. This sets language_selected = True and triggers _language_event
+        #   3. wait_for_language() returns, process_audio_stream() continues
+        #   4. Greeting is sent as first message to Gemini
+        #   5. Conversation starts with questions
         
         log.info(f"[ARI] ✅✅✅ CALL ORCHESTRATION COMPLETE FOR {call_id}")
-        log.info(f"[ARI]    ├─ Bridge: {bridge_id} (caller ↔ ExternalMedia)")
+        log.info(f"[ARI]    DTMF FLOW SUMMARY:")
+        log.info(f"[ARI]    ├─ [NOW] Prompt played: 'Press 1 (English) or 2 (Hindi)'")
+        log.info(f"[ARI]    ├─ [WAIT] Caller presses key → ARI triggers ChannelDtmfReceived")
+        log.info(f"[ARI]    ├─ [DTMF] Language set → Audio gating released")
+        log.info(f"[ARI]    ├─ [START] Greeting sent as first message to Gemini")
+        log.info(f"[ARI]    ├─ [CONV] Conversation flow: greeting → questions → mobile → closing")
+        log.info(f"[ARI]    └─ [END] Call ends → Hangup and cleanup")
+        log.info(f"[ARI]")
+        log.info(f"[ARI]    TECHNICAL DETAILS:")
+        log.info(f"[ARI]    ├─ Bridge ID: {bridge_id} (caller ↔ ExternalMedia bidirectional)")
         log.info(f"[ARI]    ├─ RTP endpoint: 163.223.186.31:{allocated_rtp_port}")
-        log.info(f"[ARI]    ├─ Gemini Live will initialize when start_listening() is called")
-        log.info(f"[ARI]    ├─ Greeting will be sent as first message to Gemini")
-        log.info(f"[ARI]    └─ Audio streaming: RTP ↔ Gemini ↔ RTP TX")
+        log.info(f"[ARI]    ├─ Gemini session language: awaiting DTMF input")
+        log.info(f"[ARI]    ├─ Audio input gate: ON (frames dropping until language selected)")
+        log.info(f"[ARI]    └─ Ready for DTMF input from caller")
 
         return True
 
@@ -317,10 +347,13 @@ async def handle_channel_dtmf_received(event: Dict[str, Any]) -> bool:
     """
     Handle DTMF digit received during call
     
-    Flow:
-    - Press 1: English
-    - Press 2: Hindi
-    - Language selection triggers greeting playback and conversation flow
+    🔧 CRITICAL DTMF FLOW:
+    1. Caller presses key (1 = English, 2 = Hindi)
+    2. Set language on Gemini audio session (releases wait_for_language())
+    3. Update call session with selected language
+    4. Save language state to Redis
+    5. Gemini will now start processing audio and send greeting
+    6. Conversation flow: greeting → questions → mobile → closing → hangup
     
     Args:
         event: ARI ChannelDtmfReceived event
@@ -337,17 +370,15 @@ async def handle_channel_dtmf_received(event: Dict[str, Any]) -> bool:
             log.error("[ARI] DTMF: missing call_id or digit")
             return False
 
-        log.info(f"[ARI] DTMF received: {call_id} - digit: {digit}")
+        log.info(f"[ARI] 🎯 DTMF received: {call_id} - digit: {digit}")
 
-        # Check if language has already been selected
-        from ..core.redis import get_session as redis_get_session
-        try:
-            language_state = await redis_get_session(f"language_selection:{call_id}")
-            if language_state:
-                log.info(f"[DTMF] Language already selected for {call_id}: ignoring DTMF")
-                return True
-        except Exception as e:
-            log.debug(f"[DTMF] Error checking language state: {e}")
+        # 🔧 CRITICAL: Check if language has already been selected to avoid duplicate processing
+        from ..services.gemini_audio_pipeline import get_gemini_audio_session
+        gemini_session = await get_gemini_audio_session(call_id)
+        
+        if gemini_session and gemini_session.language_selected:
+            log.info(f"[DTMF] Language already selected for {call_id}: {gemini_session.language} (ignoring digit {digit})")
+            return True
 
         # Map DTMF digits to languages
         language_mapping = {
@@ -357,12 +388,22 @@ async def handle_channel_dtmf_received(event: Dict[str, Any]) -> bool:
 
         selected_language = language_mapping.get(digit)
         if not selected_language:
-            log.warning(f"[DTMF] Invalid DTMF digit: {digit} (expected 1 or 2)")
-            return False
+            log.warning(f"[DTMF] Invalid DTMF digit: {digit} (expected 1 or 2), ignoring")
+            return True  # Return True but don't process invalid digits
 
-        log.info(f"[DTMF] 🎯 Language selected: {digit} → {selected_language} for {call_id}")
+        log.info(f"[DTMF] ✅ Language selected: digit {digit} → {selected_language} for {call_id}")
 
-        # Save language selection to state
+        # 🔧 STEP 1: Set language on Gemini audio session FIRST
+        # This releases the wait_for_language() blocking call in process_audio_stream()
+        # allowing Gemini to start processing audio and begin the conversation flow
+        if gemini_session:
+            gemini_session.set_call_language(selected_language)
+            log.info(f"[DTMF] ✅ Gemini session language set: {selected_language}")
+            log.info(f"[DTMF]    └─ Gemini will now start greeting and conversation flow")
+        else:
+            log.warning(f"[DTMF] ⚠️ Gemini audio session not found for {call_id}, but continuing...")
+
+        # 🔧 STEP 2: Save language selection to state (for call records)
         from ..core.redis import set_session as redis_set_session
         try:
             language_state = {
@@ -376,12 +417,12 @@ async def handle_channel_dtmf_received(event: Dict[str, Any]) -> bool:
                 language_state,
                 ttl=3600  # Keep for 1 hour
             )
-            log.info(f"[DTMF] ✅ Language state saved: {selected_language}")
+            log.info(f"[DTMF] ✅ Language state saved to Redis")
         except Exception as e:
             log.error(f"[DTMF] Error saving language state: {e}")
-            return False
+            # Don't return False here - we still want to continue
 
-        # Update call session language
+        # 🔧 STEP 3: Update call session language
         try:
             from ..session.redis_session import get_call_session
             session_mgr = get_call_session()
@@ -394,19 +435,6 @@ async def handle_channel_dtmf_received(event: Dict[str, Any]) -> bool:
         except Exception as e:
             log.warning(f"[DTMF] Error updating session language: {e}")
 
-        # 🔧 CRITICAL: Set language on Gemini audio session
-        # This releases the wait_for_language() in process_audio_stream()
-        try:
-            from ..services.gemini_audio_pipeline import get_gemini_audio_session
-            gemini_session = await get_gemini_audio_session(call_id)
-            if gemini_session:
-                gemini_session.set_call_language(selected_language)
-                log.info(f"[DTMF] ✅ Gemini session language set: {selected_language}")
-            else:
-                log.warning(f"[DTMF] ⚠️ Gemini audio session not found, but continuing...")
-        except Exception as e:
-            log.warning(f"[DTMF] Error setting Gemini language: {e}", exc_info=True)
-
         # ========== LIFECYCLE LOG: Language Selected ==========
         try:
             from ..services.call_lifecycle_logger import get_call_lifecycle_logger
@@ -416,12 +444,13 @@ async def handle_channel_dtmf_received(event: Dict[str, Any]) -> bool:
         except Exception as e:
             log.debug(f"[DTMF] Error logging language selection: {e}")
 
-        log.info(f"[DTMF] ✅✅✅ LANGUAGE SELECTION COMPLETE")
+        log.info(f"[DTMF] ✅✅✅ DTMF LANGUAGE SELECTION COMPLETE")
         log.info(f"[DTMF]    ├─ Call ID: {call_id}")
         log.info(f"[DTMF]    ├─ Language: {selected_language}")
         log.info(f"[DTMF]    ├─ DTMF Digit: {digit}")
-        log.info(f"[DTMF]    ├─ Gemini session released to start conversation")
-        log.info(f"[DTMF]    └─ Ready for greeting and conversation flow")
+        log.info(f"[DTMF]    ├─ Gemini session released from wait_for_language() blocking call")
+        log.info(f"[DTMF]    ├─ Audio input now flowing to Gemini (was gated before)")
+        log.info(f"[DTMF]    └─ Greeting will be sent as first turn, then conversation starts")
 
         return True
 
