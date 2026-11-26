@@ -142,6 +142,14 @@ class GoogleSheetsAdapter:
             mobile_number = requirements.get("mobile_number", "N/A")
             call_timestamp = requirements.get("call_timestamp", datetime.utcnow().isoformat())
             
+            # DEBUG: Log what we received
+            log.info(f"[GoogleSheets] ===== DEBUG INFO =====")
+            log.info(f"[GoogleSheets] Call Session ID received: '{call_session_id}' (type: {type(call_session_id).__name__})")
+            log.info(f"[GoogleSheets] Mobile Number received: '{mobile_number}'")
+            log.info(f"[GoogleSheets] Requirements keys: {requirements.keys()}")
+            log.info(f"[GoogleSheets] Full requirements: {requirements}")
+            log.info(f"[GoogleSheets] ====================")
+            
             # Prepare row data in exact order matching headers
             # Ensure all values are strings to prevent formatting issues
             row_data = [
@@ -157,8 +165,21 @@ class GoogleSheetsAdapter:
                 str(call_timestamp) if call_timestamp else ""
             ]
             
-            # Log the row data being saved
-            log.info(f"[GoogleSheets] Row data to save: {row_data}")
+            # Log the row data being saved with index
+            log.info(f"[GoogleSheets] Row data ({len(row_data)} values):")
+            for idx, (header, value) in enumerate(zip([
+                "Call Session ID",
+                "Customer Mobile Number",
+                "Customer Name",
+                "Company Name",
+                "Location",
+                "Interested Products",
+                "Required Quantity",
+                "Business Requirement",
+                "Bulk & Other Requirements",
+                "Call Date & Time"
+            ], row_data), 1):
+                log.info(f"[GoogleSheets]   Col {idx} ({chr(64+idx)}): {header:30s} = '{value}'")
             
             # Find next empty row by checking column A
             range_name = f"{self.sheet_tab}!A:A"

@@ -141,6 +141,10 @@ class CallHandler:
         """
         try:
             log.info(f"[CallHandler] 📞 Call ending: {call_id}")
+            log.info(f"[CallHandler] ===== CALL END DEBUG =====")
+            log.info(f"[CallHandler] call_id: {call_id}")
+            log.info(f"[CallHandler] user_id: {user_id}")
+            log.info(f"[CallHandler] caller_number: {caller_number}")
 
             # 🔧 CRITICAL: Wait for Gemini session to fully close (max 3 seconds)
             try:
@@ -168,6 +172,12 @@ class CallHandler:
             if not session:
                 log.warning(f"[CallHandler] No session found for {call_id}")
                 return False
+
+            log.info(f"[CallHandler] ===== SESSION RETRIEVED =====")
+            log.info(f"[CallHandler] Session keys: {session.keys()}")
+            log.info(f"[CallHandler] call_session_id in session: {session.get('call_session_id', 'KEY NOT FOUND')}")
+            log.info(f"[CallHandler] call_id in session: {session.get('call_id', 'KEY NOT FOUND')}")
+            log.info(f"[CallHandler] requirements_saved_to_sheets: {session.get('requirements_saved_to_sheets', 'KEY NOT FOUND')}")
 
             try:
                 from ..services.customer_requirement_service import get_customer_requirement_service
