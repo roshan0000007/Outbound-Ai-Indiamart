@@ -386,6 +386,7 @@ class GeminiLiveProvider:
 
                             tool_call = getattr(message, "tool_call", None)
                             if tool_call and tool_call.function_calls:
+                                log.debug(f"[Gemini Live] Processing {len(tool_call.function_calls)} tool calls")
                                 await handle_tool_calls(live, tool_call.function_calls)
 
                             sc = message.server_content
@@ -413,7 +414,7 @@ class GeminiLiveProvider:
 
                             if sc.turn_complete:
                                 stats["turns"] += 1
-                                log.info(f"[Gemini Live] Turn {stats['turns']} complete (greeting_pending={state['greeting_pending']}, closing_sent={state['closing_sent']})")
+                                log.info(f"[Gemini Live] Turn {stats['turns']} complete (greeting_pending={state['greeting_pending']}, closing_sent={state['closing_sent']}, answered={len(answered)}/{len(REQUIRED_QUESTIONS)})")
 
                                 if state["greeting_pending"]:
                                     # ✅ STEP 1: Greeting finished → Ask first question
@@ -431,12 +432,20 @@ class GeminiLiveProvider:
                                             log.error(f"[Gemini Live] on_call_complete error: {cb_err}")
                                     closing_done.set()
                                     return
-                                    
+                                
                                 else:
                                     # ✅ STEP NORMAL: Question asked and turn is complete
-                                    # Next action will come from handle_tool_calls() when customer response arrives
-                                    # Just continue listening for tool_call with record_answer
-                                    log.debug(f"[Gemini Live] Turn {stats['turns']} finished; waiting for customer response")
+                                    # Check if ALL questions have been answered (closing needed)
+                                    nxt = next_unanswered_index()
+                                    if nxt is None and not state["closing_sent"]:
+                                        # All questions answered - send closing
+                                        log.info(f"[Gemini Live] Turn {stats['turns']}: All questions complete, sending closing")
+                                        state["closing_sent"] = True
+                                        log.info(f"[Gemini Live] ✅ All {len(answered)} details collected; sending closing instruction")
+                                        await send_instruction(live, closing_instruction(lang))
+                                        log.info(f"[Gemini Live] Closing instruction sent, waiting for turn_complete to trigger on_call_complete")
+                                    else:
+                                        log.debug(f"[Gemini Live] Turn {stats['turns']} finished; waiting for customer response (nxt={nxt})")
 
                         if not got_message:
                             log.warning("[Gemini Live] Server closed the receive stream")
