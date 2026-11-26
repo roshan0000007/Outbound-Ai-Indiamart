@@ -62,6 +62,8 @@ class GoogleSheetsAdapter:
             if not self.service:
                 return
             
+            log.info(f"[GoogleSheets] Checking headers in sheet: {self.sheet_tab}")
+            
             # Read first row to check existing headers
             range_name = f"{self.sheet_tab}!A1:J1"
             result = self.service.spreadsheets().values().get(
@@ -71,6 +73,8 @@ class GoogleSheetsAdapter:
             
             existing_values = result.get("values", [])
             existing_headers = existing_values[0] if existing_values else []
+            
+            log.info(f"[GoogleSheets] Existing headers: {existing_headers}")
             
             # Define required headers in order
             required_headers = [
@@ -88,8 +92,9 @@ class GoogleSheetsAdapter:
             
             # Only update if headers don't match
             if existing_headers != required_headers:
-                log.info("[GoogleSheets] Creating/updating headers with new columns")
-                log.info(f"[GoogleSheets] Headers: {required_headers}")
+                log.info(f"[GoogleSheets] Creating/updating headers with new columns")
+                log.info(f"[GoogleSheets] Expected headers: {required_headers}")
+                log.info(f"[GoogleSheets] Actual headers: {existing_headers}")
                 
                 self.service.spreadsheets().values().update(
                     spreadsheetId=self.sheet_id,
@@ -99,6 +104,8 @@ class GoogleSheetsAdapter:
                 ).execute()
                 
                 log.info("[GoogleSheets] ✅ Headers ensured")
+            else:
+                log.info("[GoogleSheets] ✅ Headers already correct")
         except Exception as e:
             log.error(f"[GoogleSheets] Error ensuring headers: {e}")
 
@@ -136,18 +143,22 @@ class GoogleSheetsAdapter:
             call_timestamp = requirements.get("call_timestamp", datetime.utcnow().isoformat())
             
             # Prepare row data in exact order matching headers
+            # Ensure all values are strings to prevent formatting issues
             row_data = [
-                call_session_id,
-                mobile_number,
-                requirements.get("customer_name", ""),
-                requirements.get("company_name", ""),
-                requirements.get("location", ""),
-                requirements.get("interested_products", ""),
-                requirements.get("required_quantity", ""),
-                requirements.get("business_requirement", ""),
-                requirements.get("bulk_and_other_requirements", ""),
-                call_timestamp
+                str(call_session_id) if call_session_id else "",
+                str(mobile_number) if mobile_number else "N/A",
+                str(requirements.get("customer_name", "")) if requirements.get("customer_name") else "",
+                str(requirements.get("company_name", "")) if requirements.get("company_name") else "",
+                str(requirements.get("location", "")) if requirements.get("location") else "",
+                str(requirements.get("interested_products", "")) if requirements.get("interested_products") else "",
+                str(requirements.get("required_quantity", "")) if requirements.get("required_quantity") else "",
+                str(requirements.get("business_requirement", "")) if requirements.get("business_requirement") else "",
+                str(requirements.get("bulk_and_other_requirements", "")) if requirements.get("bulk_and_other_requirements") else "",
+                str(call_timestamp) if call_timestamp else ""
             ]
+            
+            # Log the row data being saved
+            log.info(f"[GoogleSheets] Row data to save: {row_data}")
             
             # Find next empty row by checking column A
             range_name = f"{self.sheet_tab}!A:A"
@@ -159,6 +170,8 @@ class GoogleSheetsAdapter:
             existing_rows = result.get("values", [])
             next_row = len(existing_rows) + 1
             
+            log.info(f"[GoogleSheets] Found {len(existing_rows)} existing rows, appending to row {next_row}")
+            
             # Idempotency check: Verify this call_session_id doesn't already exist
             if call_session_id:
                 range_name_check = f"{self.sheet_tab}!A:A"
@@ -168,25 +181,29 @@ class GoogleSheetsAdapter:
                 ).execute()
                 
                 existing_session_ids = existing_data.get("values", [])[1:]  # Skip header
-                for existing_id in existing_session_ids:
-                    if existing_id and existing_id[0] == call_session_id:
+                for idx, existing_id in enumerate(existing_session_ids):
+                    if existing_id and len(existing_id) > 0 and existing_id[0] == call_session_id:
                         log.warning(f"[GoogleSheets] Call {call_session_id} already saved (idempotency)")
                         return {
                             "success": True,
                             "message": "Already saved (idempotent)",
-                            "row_number": existing_rows.index([call_session_id]) + 1 if [call_session_id] in existing_rows else next_row,
+                            "row_number": idx + 2,  # +2 because header is row 1 and idx is 0-based
                             "call_session_id": call_session_id,
                             "already_saved": True
                         }
             
-            # Append row
+            # Append row with proper formatting
             range_name = f"{self.sheet_tab}!A{next_row}:J{next_row}"
-            self.service.spreadsheets().values().update(
+            log.info(f"[GoogleSheets] Updating range: {range_name}")
+            
+            response = self.service.spreadsheets().values().update(
                 spreadsheetId=self.sheet_id,
                 range=range_name,
                 valueInputOption="RAW",
                 body={"values": [row_data]}
             ).execute()
+            
+            log.info(f"[GoogleSheets] API Response: {response}")
             
             log.info(f"[GoogleSheets] ✅ Saved to row {next_row}")
             log.info(f"[GoogleSheets] Call Session ID: {call_session_id}")

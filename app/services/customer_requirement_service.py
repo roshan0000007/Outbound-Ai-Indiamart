@@ -150,118 +150,7 @@ class CustomerRequirementService:
             return False
 
     async def get_requirements(self, call_id: str) -> Optional[Dict[str, Any]]:
-        """Get all requirements for a call, including both collected and pending fields"""
-        try:
-            state = await self.get_call_state(call_id)
-            if not state:
-                return None
-            
-            return {
-                "call_id": call_id,
-                "collected": state.data,
-                "pending_fields": state.get_pending_fields(),
-                "is_complete": state.is_complete(),
-                "field_count": len([v for v in state.data.values() if v])
-            }
-        except Exception as e:
-            log.error(f"[ReqService] Error getting requirements: {e}")
-            return None
-
-    async def cleanup_call(self, call_id: str) -> bool:
-        """Clean up call state from memory and Redis"""
-        try:
-            # Remove from memory
-            if call_id in self.call_states:
-                del self.call_states[call_id]
-            
-            # Remove from Redis
-            from ..core.redis import delete_session
-            await delete_session(f"req:{call_id}")
-            
-            log.info(f"[ReqService] Cleaned up call state for {call_id}")
-            return True
-        except Exception as e:
-            log.error(f"[ReqService] Error cleaning up call: {e}")
-            return False
-    
-    async def validate_requirements(self, call_id: str) -> Dict[str, Any]:
-        """Validate current requirements state"""
-        try:
-            state = await self.get_call_state(call_id)
-            if not state:
-                return {
-                    "is_complete": False,
-                    "completed_fields": [],
-                    "pending_fields": [
-                        "customer_name", "company_name", "location",
-                        "interested_products", "required_quantity",
-                        "business_requirement", "bulk_and_other_requirements"
-                    ],
-                    "unclear_fields": [],
-                    "validation_errors": ["State not found"]
-                }
-            
-            pending = state.get_pending_fields()
-            completed = [f for f in state.data.keys() if f not in pending]
-            
-            # Validate specific fields
-            errors = []
-            unclear = []
-            
-            # Validate quantity format if provided
-            if state.data.get("required_quantity"):
-                qty = state.data["required_quantity"]
-                if not any(unit in qty.lower() for unit in ["piece", "kg", "ton", "box", "carton"]):
-                    unclear.append("required_quantity")
-                    errors.append("Quantity unit not specified")
-            
-            # Validate products if provided
-            if state.data.get("interested_products"):
-                products = state.data["interested_products"]
-                if isinstance(products, list) and len(products) == 0:
-                    unclear.append("interested_products")
-                    errors.append("No products selected")
-            
-            return {
-                "is_complete": state.is_complete(),
-                "completed_fields": completed,
-                "pending_fields": pending,
-                "unclear_fields": unclear,
-                "validation_errors": errors
-            }
-        except Exception as e:
-            log.error(f"[ReqService] Error validating requirements: {e}")
-            return {
-                "is_complete": False,
-                "completed_fields": [],
-                "pending_fields": [],
-                "unclear_fields": [],
-                "validation_errors": [str(e)]
-            }
-
-    async def save_to_database(self, call_id: str) -> bool:
-        """
-        Deprecated: Requirements are now saved to Google Sheets on call hangup.
-        This method is kept for backward compatibility but does nothing.
-        """
-        try:
-            state = await self.get_call_state(call_id)
-            if not state:
-                log.debug(f"[ReqService] No state to save: {call_id}")
-                return False
-            
-            if not state.is_complete():
-                log.debug(f"[ReqService] Skipping incomplete requirements save: {call_id}")
-                return False
-            
-            log.debug(f"[ReqService] Database save deprecated for {call_id}. Use lead storage service instead.")
-            return True
-        except Exception as e:
-            log.error(f"[ReqService] Error in save_to_database: {e}")
-            return False
-
-    async def get_requirements(self, call_id: str) -> Optional[Dict[str, Any]]:
-        """Get current requirements for a call"""
+        """Get current requirements for a call, properly formatted for Google Sheets"""
         try:
             state = await self.get_call_state(call_id)
             if state:
@@ -271,8 +160,16 @@ class CustomerRequirementService:
                 # Convert products list to comma-separated string for sheets
                 products = data.get("interested_products", [])
                 if isinstance(products, list):
-                    data["interested_products"] = ", ".join(products) if products else ""
+                    data["interested_products"] = ", ".join(str(p) for p in products) if products else ""
                 
+                # Ensure all values are strings or None
+                for key in data:
+                    if data[key] is None:
+                        data[key] = ""
+                    elif not isinstance(data[key], str):
+                        data[key] = str(data[key])
+                
+                log.debug(f"[ReqService] Returning requirements for {call_id}: {data}")
                 return data
             return None
         except Exception as e:

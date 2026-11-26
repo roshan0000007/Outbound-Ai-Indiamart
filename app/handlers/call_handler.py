@@ -200,6 +200,11 @@ class CallHandler:
                 # Check if requirements were already saved (idempotency protection)
                 requirements_already_saved = session.get("requirements_saved_to_sheets", False)
                 
+                log.info(f"[GOOGLE-SHEETS] Session ID in session: {session.get('call_session_id', 'NOT FOUND')}")
+                log.info(f"[GOOGLE-SHEETS] Requirements saved flag: {requirements_already_saved}")
+                log.info(f"[GOOGLE-SHEETS] Requirements keys: {requirements.keys() if requirements else 'None'}")
+                log.info(f"[GOOGLE-SHEETS] Requirements: {requirements if requirements else 'None'}")
+                
                 if requirements and lead_service and not requirements_already_saved:
                     log.info(f"[GOOGLE-SHEETS] Preparing customer requirement record")
                     
@@ -208,6 +213,7 @@ class CallHandler:
                     mobile_number = caller_number if caller_number != "unknown" else "N/A"
                     
                     log.info(f"[GOOGLE-SHEETS] Call Session ID: {call_session_id}")
+                    log.info(f"[GOOGLE-SHEETS] Call ID (from ARI): {call_id}")
                     log.info(f"[GOOGLE-SHEETS] Customer Mobile: {mobile_number}")
                     log.info(f"[GOOGLE-SHEETS] Validated fields: 8/8")
                     log.info(f"[GOOGLE-SHEETS] Target worksheet: GID 0")
@@ -226,6 +232,7 @@ class CallHandler:
                         "call_timestamp": datetime.utcnow().isoformat()
                     }
                     
+                    log.info(f"[GOOGLE-SHEETS] Payload: {sheets_payload}")
                     log.info(f"[GOOGLE-SHEETS] Header mapping validated")
                     log.info(f"[GOOGLE-SHEETS] Appending customer record")
                     
