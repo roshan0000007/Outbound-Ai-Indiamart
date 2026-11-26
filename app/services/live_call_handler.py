@@ -49,20 +49,25 @@ class LiveCallHandler:
         Start listening for audio on a call
         Initializes Gemini Live audio streaming and connects RTP to Gemini
         
+        🔧 CRITICAL: Pass language=None to allow DTMF-based language selection!
+        If language is preset (like "en"), it skips DTMF waiting.
+        
         Args:
             call_id: Call ID
-            language: Language code (default: en)
+            language: Language code or None to wait for DTMF (default: None for DTMF waiting)
             
         Returns:
             True if successful
         """
         try:
             log.info(f"[LiveCall] Starting audio listening: {call_id}")
+            log.info(f"[LiveCall]    ├─ Language mode: {'preset to ' + language if language else 'DTMF waiting (None)'}")
             
             # Start Gemini audio stream
+            # 🔧 IMPORTANT: Pass language=None to allow DTMF selection
             result = await self.start_call_audio_stream(
                 call_id=call_id,
-                language=language
+                language=language if language and language != "en" else None  # None allows DTMF
             )
             
             if not result or not result.get("success"):
@@ -91,8 +96,15 @@ class LiveCallHandler:
                     log.error(f"[LiveCall] Gemini audio session not found for {call_id}")
                     return False
                 
+                # Attach media session to Gemini so reply audio can be sent
+                gemini_session.attach_media(media_session)
+                log.info(f"[LiveCall] Media session attached to Gemini for audio output")
+                
                 # Start bidirectional RTP ↔ Gemini audio streaming
                 log.info(f"[LiveCall] Connecting RTP ↔ Gemini Live bidirectional streaming for {call_id}")
+                log.info(f"[LiveCall]    ├─ Caller audio will be gated until DTMF received")
+                log.info(f"[LiveCall]    ├─ Waiting for language selection via DTMF (1 or 2)")
+                log.info(f"[LiveCall]    └─ 10-second timeout, then defaults to English")
                 
                 async def run_audio_streaming():
                     """Run audio streaming as background task"""
@@ -109,8 +121,8 @@ class LiveCallHandler:
                 asyncio.create_task(run_audio_streaming())
                 
                 log.info(f"[LiveCall] ✅ Audio listening started: {call_id}")
-                log.info(f"[LiveCall]    ├─ RTP audio → Gemini Live (input)")
-                log.info(f"[LiveCall]    └─ Gemini Live → RTP audio (output)")
+                log.info(f"[LiveCall]    ├─ RTP audio → Gemini Live (gated during DTMF)")
+                log.info(f"[LiveCall]    └─ Gemini Live → RTP audio (after language selected)")
                 
                 return True
                 

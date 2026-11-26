@@ -134,13 +134,21 @@ class GeminiAudioSession:
         Also clears caller audio captured during the menu, so Gemini hears only
         what the caller says after choosing.
         """
+        log.info(f"[Gemini Audio] ⏳ WAITING FOR LANGUAGE SELECTION (timeout: {timeout}s)")
+        log.info(f"[Gemini Audio]    ├─ Listening for DTMF: 1 (English) or 2 (Hindi)")
+        log.info(f"[Gemini Audio]    ├─ Audio input is GATED - frames being dropped")
+        log.info(f"[Gemini Audio]    └─ Blocking call until DTMF received or timeout")
+        
         if not self.language_selected:
             try:
                 await asyncio.wait_for(self._language_event.wait(), timeout=timeout)
+                log.info(f"[Gemini Audio] ✅ LANGUAGE SELECTED BY DTMF: {self.language}")
             except asyncio.TimeoutError:
-                log.info(f"[Gemini Audio] No language choice in {timeout}s; using {DEFAULT_CALL_LANGUAGE}")
+                log.warning(f"[Gemini Audio] ⚠️ No language choice in {timeout}s; using {DEFAULT_CALL_LANGUAGE}")
                 self.set_call_language(DEFAULT_CALL_LANGUAGE)
+                log.info(f"[Gemini Audio] ✅ TIMEOUT FALLBACK: {DEFAULT_CALL_LANGUAGE}")
 
+        # Clear audio buffer from during the menu
         drained = 0
         while not self.audio_buffer.empty():
             try:
@@ -149,8 +157,13 @@ class GeminiAudioSession:
             except asyncio.QueueEmpty:
                 break
         if drained:
-            log.debug(f"[Gemini Audio] Dropped {drained} menu-time audio frames")
+            log.info(f"[Gemini Audio] 🗑️ Dropped {drained} menu-time audio frames (gated)")
 
+        log.info(f"[Gemini Audio] ✅ LANGUAGE CONFIRMED: {self.language}")
+        log.info(f"[Gemini Audio]    ├─ Audio input gate: OPENED (frames now flowing)")
+        log.info(f"[Gemini Audio]    ├─ Ready to send greeting")
+        log.info(f"[Gemini Audio]    └─ Conversation flow starting...")
+        
         return self.language
 
     # ------------------------------------------------------------------ #
