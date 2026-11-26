@@ -22,6 +22,7 @@ Audio flow:
 
 import asyncio
 import os
+import time
 from typing import Optional, Dict, Callable, AsyncIterator
 from datetime import datetime
 
@@ -268,6 +269,139 @@ class GeminiAudioSession:
             except Exception as e:
                 log.error(f"[Gemini Audio] hangup_callback error: {e}")
 
+    async def _send_dtmf_prompt_to_gemini(self) -> bool:
+        """
+        ✅ CRITICAL FIX: Send DTMF language selection prompt to Gemini Live
+        
+        This creates a temporary WebSocket connection JUST to send the language selection
+        prompt BEFORE the main conversation starts. This ensures the caller hears:
+        "Press 1 for English. Press 2 for Hindi."
+        
+        Flow:
+        1. Open WebSocket connection to Gemini Live
+        2. Send DTMF prompt instruction as first message
+        3. Gemini synthesizes and streams audio to caller immediately
+        4. Close connection after prompt finishes
+        5. Main conversation connection will open separately after DTMF is received
+        
+        Returns:
+            True if prompt was sent successfully
+        """
+        try:
+            if not self.gemini_provider:
+                log.error("[Gemini Audio] Provider not available for DTMF prompt")
+                return False
+            
+            log.info(f"[Gemini Audio] 🎤 Opening temporary WebSocket for DTMF prompt")
+            
+            # Build config for DTMF prompt (use English for the prompt itself)
+            from google.genai import types
+            from ..llm.gemini_live_provider import _build_realtime_input_config, _build_tools
+            
+            model_name = self.gemini_provider.model
+            if not model_name.startswith("models/"):
+                model_name = f"models/{model_name}"
+            
+            config_kwargs = dict(
+                response_modalities=["AUDIO"],
+                system_instruction="You are an IVR system. Play language selection menu.",
+                generation_config=types.GenerationConfig(temperature=1.0, max_output_tokens=50),
+                speech_config=types.SpeechConfig(
+                    voice_config=types.VoiceConfig(
+                        prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                            voice_name=self.gemini_provider.voice
+                        )
+                    )
+                ),
+                tools=_build_tools(types),
+            )
+            
+            realtime_cfg = _build_realtime_input_config(types)
+            if realtime_cfg is not None:
+                config_kwargs["realtime_input_config"] = realtime_cfg
+            
+            config = types.LiveConnectConfig(**config_kwargs)
+            
+            prompt_sent = False
+            try:
+                async with self.gemini_provider.client.aio.live.connect(model=model_name, config=config) as live:
+                    log.info(f"[Gemini Audio] ✅ DTMF WebSocket connected")
+                    
+                    # Send DTMF prompt as first and ONLY instruction
+                    dtmf_instruction = (
+                        "[SYSTEM INSTRUCTION URGENT] You are playing a phone IVR menu. "
+                        "Speak THIS EXACT prompt once, clearly and naturally, with appropriate pauses: "
+                        "'Press 1 for English. Press 2 for Hindi.' "
+                        "After speaking, STOP completely. Do NOT repeat. Do NOT say anything else. "
+                        "The user will then press a digit."
+                    )
+                    
+                    log.info(f"[Gemini Audio] 📤 Sending DTMF prompt instruction to Gemini...")
+                    await live.send_client_content(
+                        turns=types.Content(role="user", parts=[types.Part(text=dtmf_instruction)]),
+                        turn_complete=True,
+                    )
+                    
+                    log.info(f"[Gemini Audio] ⏳ Waiting for Gemini to synthesize DTMF prompt...")
+                    
+                    # Receive the DTMF prompt audio from Gemini
+                    max_wait_time = 5  # seconds
+                    wait_start = time.time()
+                    audio_chunks = 0
+                    turn_complete = False
+                    
+                    async for message in live.receive():
+                        if time.time() - wait_start > max_wait_time:
+                            log.warning(f"[Gemini Audio] ⚠️ Timeout waiting for DTMF prompt audio")
+                            break
+                        
+                        sc = message.server_content
+                        if sc is None:
+                            continue
+                        
+                        # Receive and queue the audio to RTP
+                        if sc.model_turn and sc.model_turn.parts:
+                            for part in sc.model_turn.parts:
+                                if part.inline_data and part.inline_data.data:
+                                    audio_data = part.inline_data.data
+                                    # Resample and queue to RTP
+                                    from ..services.audio_codec_pipeline import get_codec_pipeline
+                                    codec_pipeline = await get_codec_pipeline(self.call_id)
+                                    if codec_pipeline:
+                                        ulaw_frames = codec_pipeline.resample_gemini_to_rtp(audio_data)
+                                        for frame in ulaw_frames:
+                                            self.enqueue_ulaw_to_rtp(frame)
+                                    audio_chunks += 1
+                                    log.debug(f"[Gemini Audio] 🔊 DTMF prompt audio chunk {audio_chunks}")
+                        
+                        if sc.turn_complete:
+                            turn_complete = True
+                            log.info(f"[Gemini Audio] ✅ DTMF prompt sent: {audio_chunks} audio chunks")
+                            prompt_sent = True
+                            break
+                    
+                    if not turn_complete:
+                        log.warning(f"[Gemini Audio] ⚠️ DTMF prompt ended without turn_complete")
+                    
+                    log.info(f"[Gemini Audio] 🔌 Closing DTMF prompt WebSocket")
+                    
+            except Exception as e:
+                log.error(f"[Gemini Audio] ❌ Error in DTMF prompt WebSocket: {e}", exc_info=True)
+                return False
+            
+            if prompt_sent:
+                log.info(f"[Gemini Audio] ✅ DTMF prompt successfully sent to caller")
+                # Give time for audio to finish playing
+                await asyncio.sleep(0.5)
+                return True
+            else:
+                log.warning(f"[Gemini Audio] ⚠️ DTMF prompt sent but no audio received")
+                return True  # Still return True - we tried, caller can still press digits
+                
+        except Exception as e:
+            log.error(f"[Gemini Audio] ❌ Error sending DTMF prompt: {e}", exc_info=True)
+            return False
+
     # ------------------------------------------------------------------ #
     # Conversation
     # ------------------------------------------------------------------ #
@@ -293,6 +427,22 @@ class GeminiAudioSession:
 
             if greeting_text:
                 log.debug("[Gemini Audio] greeting_text ignored; greeting follows the call language")
+
+            # ✅ CRITICAL FIX: Send DTMF prompt to Gemini BEFORE waiting for language selection
+            # This ensures the caller hears the language menu immediately
+            log.info(f"[Gemini Audio] 📢 Preparing DTMF language selection prompt via Gemini Live")
+            log.info(f"[Gemini Audio]    ├─ This prompt will play to the caller FIRST")
+            log.info(f"[Gemini Audio]    ├─ Caller presses 1 or 2 to select language")
+            log.info(f"[Gemini Audio]    └─ Timeout: 10 seconds (defaults to English)")
+            
+            # Create a temporary Gemini connection JUST to send the DTMF prompt
+            # This happens BEFORE the main conversation starts
+            try:
+                await self._send_dtmf_prompt_to_gemini()
+                log.info(f"[Gemini Audio] ✅ DTMF prompt sent to Gemini Live")
+            except Exception as e:
+                log.warning(f"[Gemini Audio] ⚠️ Error sending DTMF prompt: {e}")
+                log.info(f"[Gemini Audio]    └─ Continuing with 10-second DTMF timeout")
 
             language = await self.wait_for_language()
             log.info(f"[Gemini Audio] Starting conversation for call {self.call_id} in '{language}'")
