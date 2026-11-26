@@ -20,32 +20,17 @@ from ..services.gemini_audio_pipeline import get_gemini_audio_session
 
 def _generate_dtmf_prompt_audio() -> bytes:
     """
-    Generate 8kHz mu-law audio prompt for language selection.
-    Fallback: Use pre-recorded file or generate DTMF tones + silence pattern.
+    Generate simple 8kHz mu-law audio prompt: "Press 1 for English, Press 2 for Hindi"
+    If TTS is not available, returns a beep sequence as fallback
     """
     try:
-        # Try to load pre-recorded language selection prompt
-        import os
-        prompt_file = os.path.join(os.path.dirname(__file__), "..", "assets", "dtmf_prompt.wav")
-        if os.path.exists(prompt_file):
-            log.info("[Greeting] Loading language prompt from file")
-            import wave
-            with wave.open(prompt_file, 'rb') as wav_file:
-                audio_data = wav_file.readframes(wav_file.getnframes())
-                # Convert to mu-law if needed
-                import audioop
-                return audioop.lin2ulaw(audio_data, 2)
-    except Exception as e:
-        log.debug(f"[Greeting] Could not load from file: {e}")
-
-    try:
         # Try to use Google TTS if available
-        log.info("[Greeting] Attempting to generate prompt using Google TTS")
+        import threading
         from google.cloud import texttospeech
         
         client = texttospeech.TextToSpeechClient()
         synthesis_input = texttospeech.SynthesisInput(
-            text="Press 1 for English, 2 for Hindi. Press 1 for English, 2 for Hindi."
+            text="Press 1 for English. Press 2 for Hindi."
         )
         voice = texttospeech.VoiceSelectionParams(
             language_code="en-US",
@@ -53,85 +38,42 @@ def _generate_dtmf_prompt_audio() -> bytes:
         )
         audio_config = texttospeech.AudioConfig(
             audio_encoding=texttospeech.AudioEncoding.LINEAR16,
-            sample_rate_hertz=8000,
-            pitch_semitones=0,
-            speaking_rate_percent=100
+            sample_rate_hertz=8000
         )
         
         response = client.synthesize_speech(
             input=synthesis_input, voice=voice, audio_config=audio_config
         )
         
-        log.info(f"[Greeting] ✅ TTS generated {len(response.audio_content)} bytes")
+        # Convert LINEAR16 to mu-law using audioop
         import audioop
-        mu_law_audio = audioop.lin2ulaw(response.audio_content, 2)
-        log.info(f"[Greeting] ✅ Converted to mu-law: {len(mu_law_audio)} bytes")
-        return mu_law_audio
+        return audioop.lin2ulaw(response.audio_content, 2)
     except Exception as e:
-        log.warning(f"[Greeting] TTS not available: {e}")
-
-    # Fallback: Generate DTMF-like tone pattern (more recognizable than sine wave)
-    # This creates dual-tone multi-frequency (DTMF) tones for 1 and 2
-    log.info("[Greeting] Using DTMF tone pattern fallback")
-    
-    sample_rate = 8000
-    duration_per_tone = 500  # 500ms per tone
-    silence = 300  # 300ms silence between tones
-    
-    def generate_dtmf_tone(freq1: int, freq2: int, duration_ms: int, sample_rate: int = 8000) -> bytes:
-        """Generate DTMF tone (dual frequency)"""
-        num_samples = int(sample_rate * duration_ms / 1000)
+        log.debug(f"[Greeting] TTS unavailable, using fallback beep sequence: {e}")
+        
+        # Fallback: Generate simple beep sequence (1000Hz tone, 200ms, repeated)
+        # This is a placeholder; in production, use a pre-recorded file
+        sample_rate = 8000
+        duration_ms = 1000
+        frequency = 1000
+        
         samples = []
-        for i in range(num_samples):
-            angle1 = 2.0 * 3.14159 * freq1 * i / sample_rate
-            angle2 = 2.0 * 3.14159 * freq2 * i / sample_rate
-            # Combine both frequencies
-            sample = int(16384 * (0.3 * __import__('math').sin(angle1) + 0.3 * __import__('math').sin(angle2)))
-            sample = max(-32768, min(32767, sample))  # Clamp to 16-bit range
-            samples.append(sample)
-        return struct.pack('<' + 'h' * len(samples), *samples)
-    
-    def generate_silence(duration_ms: int, sample_rate: int = 8000) -> bytes:
-        """Generate silence"""
         num_samples = int(sample_rate * duration_ms / 1000)
-        return struct.pack('<' + 'h' * num_samples, *([0] * num_samples))
-    
-    try:
-        # DTMF frequencies: 1=(697Hz, 1209Hz), 2=(697Hz, 1336Hz)
-        # Pattern: "Press 1" tone, silence, "Press 2" tone, silence, repeat
-        import audioop
-        
-        audio_parts = []
-        
-        # Tone for key 1 (3 times for emphasis)
-        for _ in range(3):
-            audio_parts.append(generate_dtmf_tone(697, 1209, duration_per_tone))
-            audio_parts.append(generate_silence(silence))
-        
-        # Tone for key 2 (3 times for emphasis)
-        for _ in range(3):
-            audio_parts.append(generate_dtmf_tone(697, 1336, duration_per_tone))
-            audio_parts.append(generate_silence(silence))
-        
-        combined_audio = b''.join(audio_parts)
-        mu_law_audio = audioop.lin2ulaw(combined_audio, 2)
-        
-        log.info(f"[Greeting] ✅ DTMF tones generated: {len(mu_law_audio)} bytes")
-        return mu_law_audio
-        
-    except Exception as e:
-        log.error(f"[Greeting] Error generating DTMF tones: {e}")
-        # Last resort: simple beep
-        log.info("[Greeting] Using simple beep fallback")
-        num_samples = sample_rate * 2  # 2 seconds of beep
-        samples = []
         for i in range(num_samples):
-            angle = 2.0 * 3.14159 * 800 * i / sample_rate
-            sample = int(16384 * 0.5 * __import__('math').sin(angle))
+            # Generate sine wave
+            angle = 2.0 * 3.14159 * frequency * i / sample_rate
+            sample = int(32767 * 0.5 * (1 + __import__('math').sin(angle)))
             samples.append(sample)
+        
+        # Convert to bytes and then to mu-law
         audio_bytes = struct.pack('<' + 'h' * len(samples), *samples)
         import audioop
-        return audioop.lin2ulaw(audio_bytes, 2)
+        try:
+            return audioop.lin2ulaw(audio_bytes, 2)
+        except:
+            # Last resort: return silence
+            log.warning("[Greeting] Could not generate audio prompt")
+            return b'\xff' * (sample_rate * duration_ms // 1000)
 
 
 class GreetingService:

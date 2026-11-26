@@ -256,9 +256,7 @@ async def handle_stasis_start(event: Dict[str, Any]) -> bool:
         
         live_handler = get_live_call_handler()
         if live_handler:
-            # 🔧 CRITICAL: Pass NO language (None) so Gemini waits for DTMF
-            # This allows the DTMF handler to set language and release the blocking wait
-            listen_success = await live_handler.start_listening(call_id, language=None)
+            listen_success = await live_handler.start_listening(call_id)
             if not listen_success:
                 log.warning(f"[ARI] Failed to start listening, but continuing call")
         
