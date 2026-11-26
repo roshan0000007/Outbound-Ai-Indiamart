@@ -215,32 +215,12 @@ async def handle_stasis_start(event: Dict[str, Any]) -> bool:
         except Exception as e:
             log.warning(f"[ARI] Failed to initialize requirements: {e}")
         
-        # ========== STEP 6: SET HINDI AS DEFAULT LANGUAGE ==========
-        # ✅ TEMPORARY FIX: Directly set Hindi language for all incoming calls
-        # This skips DTMF prompt and language selection
-        log.info(f"[ARI] 🌐 Setting default language: HINDI for {call_id}")
         
-        try:
-            from ..services.gemini_audio_pipeline import get_gemini_audio_session
-            gemini_session = await get_gemini_audio_session(call_id)
-            if gemini_session:
-                # Set language to Hindi directly
-                gemini_session.set_call_language("hi")
-                log.info(f"[ARI] ✅ Language set to HINDI")
-                log.info(f"[ARI]    ├─ Skipping DTMF prompt")
-                log.info(f"[ARI]    ├─ Call will use Hindi greeting and questions")
-                log.info(f"[ARI]    └─ Greeting will play immediately in Hindi")
-            else:
-                log.warning(f"[ARI] Gemini session not found for language setting")
-        except Exception as e:
-            log.warning(f"[ARI] Error setting default language: {e}")
-        
-        
-        # ========== STEP 7: Start listening (Language is already set to Hindi) ==========
-        # Hindi has been pre-selected in Step 6
-        # Gemini session will NOT wait for DTMF - it will proceed directly to greeting
-        # Audio input is NOT gated - flowing to Gemini immediately
-        log.info(f"[ARI] ⏳ Starting audio listening (Hindi mode active)...")
+        # ========== STEP 6: Start listening with Hindi language ==========
+        # Hindi language is passed directly to start_listening()
+        # This sets the language BEFORE Gemini session is created
+        # No DTMF prompt needed - language is pre-selected
+        log.info(f"[ARI] 📢 Starting audio listening with HINDI language for {call_id}")
         log.info(f"[ARI]    ├─ Language: HINDI (pre-selected)")
         log.info(f"[ARI]    ├─ No DTMF prompt - no waiting for digit")
         log.info(f"[ARI]    ├─ Audio input is ACTIVE (not gated)")
@@ -248,11 +228,12 @@ async def handle_stasis_start(event: Dict[str, Any]) -> bool:
         
         live_handler = get_live_call_handler()
         if live_handler:
-            listen_success = await live_handler.start_listening(call_id)
+            # ✅ PASS HINDI LANGUAGE TO start_listening
+            listen_success = await live_handler.start_listening(call_id, language="hi")
             if not listen_success:
                 log.warning(f"[ARI] Failed to start listening, but continuing call")
         
-        # ========== STEP 8: Gemini starts immediately with Hindi greeting ==========
+        # ========== STEP 7: Gemini starts immediately with Hindi greeting ==========
         # No DTMF waiting - language is already set
         # Greeting is sent as first message in Hindi
         # Conversation starts with questions in Hindi
@@ -260,6 +241,7 @@ async def handle_stasis_start(event: Dict[str, Any]) -> bool:
         log.info(f"[ARI] ✅✅✅ CALL ORCHESTRATION COMPLETE FOR {call_id}")
         log.info(f"[ARI]    CALL FLOW SUMMARY (HINDI MODE):")
         log.info(f"[ARI]    ├─ [NOW] Language pre-set to HINDI")
+        log.info(f"[ARI]    ├─ [NOW] Gemini session initialized with Hindi")
         log.info(f"[ARI]    ├─ [NOW] No DTMF prompt - no waiting")
         log.info(f"[ARI]    ├─ [START] Greeting sent immediately in Hindi")
         log.info(f"[ARI]    ├─ [CONV] Questions 1-7 in Hindi")
@@ -270,9 +252,9 @@ async def handle_stasis_start(event: Dict[str, Any]) -> bool:
         log.info(f"[ARI]    TECHNICAL DETAILS:")
         log.info(f"[ARI]    ├─ Bridge ID: {bridge_id} (caller ↔ ExternalMedia bidirectional)")
         log.info(f"[ARI]    ├─ RTP endpoint: 163.223.186.31:{allocated_rtp_port}")
-        log.info(f"[ARI]    ├─ Gemini session language: HINDI (pre-selected)")
+        log.info(f"[ARI]    ├─ Gemini session language: HINDI (pre-selected via start_listening)")
         log.info(f"[ARI]    ├─ Audio input gate: OFF (frames flowing to Gemini)")
-        log.info(f"[ARI]    └─ Ready to start greeting immediately")
+        log.info(f"[ARI]    └─ Ready to start greeting immediately in Hindi")
 
         return True
 
