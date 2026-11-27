@@ -53,11 +53,15 @@ class GeminiAudioSession:
         self.language_selected = False
         self._language_event = asyncio.Event()
 
-        # Collected answers for this call only
+        # Collected answers for this call only (local tracking)
         self.collected: Dict[str, str] = {}
 
         # Optional hook for ARI: called when the closing message has finished
         self.hangup_callback: Optional[Callable[[str], None]] = None
+
+        # Reference to CustomerRequirementService for persistent storage during call
+        from ..services.customer_requirement_service import get_customer_requirement_service
+        self.req_service = get_customer_requirement_service()
 
         if language in ("en", "hi"):
             self.set_call_language(language)
@@ -246,6 +250,21 @@ class GeminiAudioSession:
         """Called by the provider each time a customer answer is saved."""
         self.collected[field] = value
         log.info(f"[CALL-DATA] {self.call_id} | {field} = {value}")
+        
+        # ✅ CRITICAL FIX: Immediately persist to CustomerRequirementService during call
+        if self.req_service:
+            try:
+                # Use asyncio.create_task to avoid blocking the audio stream
+                import asyncio
+                asyncio.create_task(
+                    self.req_service.update_requirements(
+                        self.call_id,
+                        {field: value}
+                    )
+                )
+                log.debug(f"[Gemini Audio] Persisted {field} to CustomerRequirementService")
+            except Exception as e:
+                log.error(f"[Gemini Audio] Failed to persist {field} to ReqService: {e}")
 
     def log_call_summary(self) -> None:
         """Print every collected detail for this call."""
@@ -258,6 +277,29 @@ class GeminiAudioSession:
             log.info(f"[CALL-DATA]   {field:<28}: {value}")
         log.info(f"[CALL-DATA] Collected {len(self.collected)} of {len(REQUIRED_QUESTIONS)} fields")
         log.info("=" * 60)
+        
+        # ✅ CRITICAL FIX #4: Mark requirements as ready after all data is logged
+        # This signals that the [CALL-DATA] summary extraction is complete
+        try:
+            if self.req_service:
+                # Use asyncio.create_task to avoid blocking
+                asyncio.create_task(self._mark_requirements_ready())
+        except Exception as e:
+            log.debug(f"[Gemini Audio] Error marking requirements ready: {e}")
+    
+    async def _mark_requirements_ready(self) -> None:
+        """Mark requirements as ready in RedisSession for CallHandler to detect."""
+        try:
+            from ..core.redis import set_session
+            # Store requirements_ready flag to signal stream completion
+            await set_session(
+                f"req_ready:{self.call_id}",
+                {"ready": True, "timestamp": datetime.utcnow().isoformat()},
+                ttl=60  # 60 second TTL - should be consumed quickly
+            )
+            log.info(f"[Gemini Audio] ✅ Requirements ready flag set for {self.call_id}")
+        except Exception as e:
+            log.error(f"[Gemini Audio] Error setting requirements_ready flag: {e}")
 
     def on_call_complete(self) -> None:
         """Called by the provider after the closing message has finished."""

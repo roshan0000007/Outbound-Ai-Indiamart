@@ -113,21 +113,36 @@ class GoogleSheetsAdapter:
         """
         Save requirements to Google Sheets with Call Session ID, Mobile Number, and timestamp.
         
+        Supports PARTIAL DATA: Even if only 1-7 fields captured (not full 8/8), saves all
+        captured fields with non-N/A values and marks missing fields as 'N/A'.
+        
         Args:
-            requirements: Dict with keys:
-                - call_session_id: Unique call session identifier
-                - mobile_number: Customer's phone number
-                - customer_name: Name
-                - company_name: Company
-                - location: Location
-                - interested_products: Products
-                - required_quantity: Quantity
-                - business_requirement: Business need
-                - bulk_and_other_requirements: Other requirements
-                - call_timestamp: ISO format datetime string (optional, generated if missing)
+            requirements: Dict with keys (all optional, N/A if missing):
+                - call_session_id: Unique call session identifier (Col A)
+                - mobile_number: Customer's phone number from ARI or input (Col B)
+                - customer_name: Captured name (Col C)
+                - company_name: Captured company (Col D)
+                - location: Captured location (Col E)
+                - interested_products: Captured products (Col F)
+                - required_quantity: Captured quantity (Col G)
+                - business_requirement: Captured requirement (Col H)
+                - bulk_and_other_requirements: Captured bulk info (Col I)
+                - call_timestamp: ISO format datetime string (Col J)
                 
         Returns:
             Dict with success status, message, row_number, and call_session_id
+            
+        COLUMN MAPPING (10 columns in Client_Requirements sheet):
+            A: Call Session ID
+            B: Customer Mobile Number
+            C: Customer Name
+            D: Company Name
+            E: Location
+            F: Interested Products
+            G: Required Quantity
+            H: Business Requirement
+            I: Bulk & Other Requirements
+            J: Call Date & Time
         """
         try:
             if not self.service:
@@ -142,44 +157,26 @@ class GoogleSheetsAdapter:
             mobile_number = requirements.get("mobile_number", "N/A")
             call_timestamp = requirements.get("call_timestamp", datetime.utcnow().isoformat())
             
-            # DEBUG: Log what we received
-            log.info(f"[GoogleSheets] ===== DEBUG INFO =====")
-            log.info(f"[GoogleSheets] Call Session ID received: '{call_session_id}' (type: {type(call_session_id).__name__})")
-            log.info(f"[GoogleSheets] Mobile Number received: '{mobile_number}'")
-            log.info(f"[GoogleSheets] Requirements keys: {requirements.keys()}")
-            log.info(f"[GoogleSheets] Full requirements: {requirements}")
-            log.info(f"[GoogleSheets] ====================")
-            
             # Prepare row data in exact order matching headers
             # Ensure all values are strings to prevent formatting issues
+            # PARTIAL DATA: Save N/A for missing fields, preserve captured values exactly
             row_data = [
                 str(call_session_id) if call_session_id else "",
                 str(mobile_number) if mobile_number else "N/A",
-                str(requirements.get("customer_name", "")) if requirements.get("customer_name") else "",
-                str(requirements.get("company_name", "")) if requirements.get("company_name") else "",
-                str(requirements.get("location", "")) if requirements.get("location") else "",
-                str(requirements.get("interested_products", "")) if requirements.get("interested_products") else "",
-                str(requirements.get("required_quantity", "")) if requirements.get("required_quantity") else "",
-                str(requirements.get("business_requirement", "")) if requirements.get("business_requirement") else "",
-                str(requirements.get("bulk_and_other_requirements", "")) if requirements.get("bulk_and_other_requirements") else "",
+                str(requirements.get("customer_name", "")) if requirements.get("customer_name") else "N/A",
+                str(requirements.get("company_name", "")) if requirements.get("company_name") else "N/A",
+                str(requirements.get("location", "")) if requirements.get("location") else "N/A",
+                str(requirements.get("interested_products", "")) if requirements.get("interested_products") else "N/A",
+                str(requirements.get("required_quantity", "")) if requirements.get("required_quantity") else "N/A",
+                str(requirements.get("business_requirement", "")) if requirements.get("business_requirement") else "N/A",
+                str(requirements.get("bulk_and_other_requirements", "")) if requirements.get("bulk_and_other_requirements") else "N/A",
                 str(call_timestamp) if call_timestamp else ""
             ]
             
-            # Log the row data being saved with index
-            log.info(f"[GoogleSheets] Row data ({len(row_data)} values):")
-            for idx, (header, value) in enumerate(zip([
-                "Call Session ID",
-                "Customer Mobile Number",
-                "Customer Name",
-                "Company Name",
-                "Location",
-                "Interested Products",
-                "Required Quantity",
-                "Business Requirement",
-                "Bulk & Other Requirements",
-                "Call Date & Time"
-            ], row_data), 1):
-                log.info(f"[GoogleSheets]   Col {idx} ({chr(64+idx)}): {header:30s} = '{value}'")
+            # Count captured fields (non-N/A values in requirement columns C-I)
+            captured_count = sum(1 for val in row_data[2:9] if val and val != "N/A" and val.strip() != "")
+            log.info(f"[GoogleSheets] Requirement fields: {captured_count}/7 captured")
+            log.info(f"[GoogleSheets] Row mapping: A={row_data[0]}, B={row_data[1]}, C-I={{...{captured_count}...}}, J={row_data[9]}")
             
             # Find next empty row by checking column A
             range_name = f"{self.sheet_tab}!A:A"

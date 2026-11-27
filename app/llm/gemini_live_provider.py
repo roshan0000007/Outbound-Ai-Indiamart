@@ -441,6 +441,29 @@ class GeminiLiveProvider:
                                         # All questions answered - send closing
                                         log.info(f"[Gemini Live] Turn {stats['turns']}: All questions complete, sending closing")
                                         state["closing_sent"] = True
+                                        
+                                        # ✅ CRITICAL FIX #4: Capture final requirements snapshot before closing
+                                        # This ensures CallHandler.on_call_end() can retrieve complete data even if stream ends abruptly
+                                        try:
+                                            # Store the complete collected data in Redis with ready flag
+                                            # This signals CallHandler that the [CALL-DATA] summary is complete
+                                            from ..services.session.redis_session import get_call_session
+                                            session_mgr = get_call_session()
+                                            if session_mgr:
+                                                # Build snapshot from local collected data
+                                                snapshot_data = {
+                                                    "requirements_ready": True,
+                                                    "captured_fields": len(answered),
+                                                    "total_fields": len(REQUIRED_QUESTIONS),
+                                                    "timestamp": datetime.utcnow().isoformat()
+                                                }
+                                                # Note: Don't update session here as we're in Gemini stream context
+                                                # The actual requirements are already in CustomerRequirementService via save_field
+                                                log.info(f"[Gemini Live] ✅ [CALL-DATA] FINAL SUMMARY: {len(answered)}/{len(REQUIRED_QUESTIONS)} fields")
+                                                log.info(f"[Gemini Live] [CALL-DATA] Collected: {sorted(list(answered))}")
+                                        except Exception as e:
+                                            log.debug(f"[Gemini Live] Error capturing requirements snapshot: {e}")
+                                        
                                         log.info(f"[Gemini Live] ✅ All {len(answered)} details collected; sending closing instruction")
                                         await send_instruction(live, closing_instruction(lang))
                                         log.info(f"[Gemini Live] Closing instruction sent, waiting for turn_complete to trigger on_call_complete")

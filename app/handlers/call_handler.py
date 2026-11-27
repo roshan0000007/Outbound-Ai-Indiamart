@@ -58,6 +58,42 @@ class CallHandler:
 
             log.info(f"[CallHandler] ✅ Session initialized for {call_id}")
             
+            # ✅ CRITICAL FIX #2: Store caller_number from ARI at call start
+            # This ensures mobile_number never becomes 'unknown' or 'N/A'
+            if caller_number and caller_number != "unknown":
+                # Normalize phone number: remove leading 0, keep only digits
+                normalized_caller = ''.join(c for c in caller_number if c.isdigit())
+                if normalized_caller.startswith('0'):
+                    normalized_caller = normalized_caller[1:]
+                
+                log.info(f"[CallHandler] 📱 Storing mobile_number from ARI: {normalized_caller}")
+                
+                # Store in session for later retrieval at call end
+                await session_mgr.update_session(
+                    call_id,
+                    {"caller_number": normalized_caller}
+                )
+                
+                # Store in CustomerRequirementService as mobile_number
+                try:
+                    from ..services.customer_requirement_service import get_customer_requirement_service
+                    req_service = get_customer_requirement_service()
+                    if req_service:
+                        await req_service.update_requirements(
+                            call_id,
+                            {"mobile_number": normalized_caller}
+                        )
+                        log.info(f"[CallHandler] ✅ mobile_number persisted to ReqService: {normalized_caller}")
+                except Exception as e:
+                    log.error(f"[CallHandler] Failed to store mobile_number in ReqService: {e}")
+            else:
+                log.warning(f"[CallHandler] ⚠️ No valid caller_number provided")
+                # Store placeholder but don't use it yet - wait for customer-provided number
+                await session_mgr.update_session(
+                    call_id,
+                    {"caller_number": "unknown"}
+                )
+            
             # Initialize LLM failover service for this call
             try:
                 from ..services.llm_failover_service import get_llm_failover_service
@@ -141,10 +177,6 @@ class CallHandler:
         """
         try:
             log.info(f"[CallHandler] 📞 Call ending: {call_id}")
-            log.info(f"[CallHandler] ===== CALL END DEBUG =====")
-            log.info(f"[CallHandler] call_id: {call_id}")
-            log.info(f"[CallHandler] user_id: {user_id}")
-            log.info(f"[CallHandler] caller_number: {caller_number}")
 
             # 🔧 CRITICAL: Wait for Gemini session to fully close (max 3 seconds)
             try:
@@ -173,12 +205,6 @@ class CallHandler:
                 log.warning(f"[CallHandler] No session found for {call_id}")
                 return False
 
-            log.info(f"[CallHandler] ===== SESSION RETRIEVED =====")
-            log.info(f"[CallHandler] Session keys: {session.keys()}")
-            log.info(f"[CallHandler] call_session_id in session: {session.get('call_session_id', 'KEY NOT FOUND')}")
-            log.info(f"[CallHandler] call_id in session: {session.get('call_id', 'KEY NOT FOUND')}")
-            log.info(f"[CallHandler] requirements_saved_to_sheets: {session.get('requirements_saved_to_sheets', 'KEY NOT FOUND')}")
-
             try:
                 from ..services.customer_requirement_service import get_customer_requirement_service
                 from ..services.requirement_tools_service import get_requirement_tools_service
@@ -199,12 +225,85 @@ class CallHandler:
                 # Ensure termination sequence exists
                 term_seq = create_termination_sequence(call_id)
 
-                # Get collected requirements
+                # ✅ CRITICAL FIX #3: Multi-source merge for requirements with wait logic
+                # 1. Wait briefly for Gemini cleanup to finish
+                # 2. Merge from GeminiAudioSession.collected + ReqService + Redis
+                # 3. Preserve partial data (don't overwrite captured fields with empty strings)
+                
+                log.info(f"[CallHandler] 🔄 Fetching requirements from multiple sources for {call_id}...")
+                
                 requirements = None
+                gemini_session = None
+                
+                # Try to get Gemini session for direct access to collected data
+                try:
+                    from ..services.gemini_audio_pipeline import get_gemini_audio_session
+                    gemini_session = await get_gemini_audio_session(call_id)
+                except Exception as e:
+                    log.debug(f"[CallHandler] Could not get Gemini session: {e}")
+                
+                # Wait up to 2 seconds for Gemini stream final summary to complete
+                # This allows the [CALL-DATA] summary extraction to finish
+                log.info(f"[CallHandler] ⏳ Waiting up to 2.0s for Gemini final summary (stream end)...")
+                for wait_attempt in range(20):  # 20 * 100ms = 2.0s
+                    if gemini_session and not gemini_session.session_active:
+                        log.info(f"[CallHandler] ✅ Gemini session finalized after {wait_attempt * 100}ms")
+                        break
+                    await asyncio.sleep(0.1)
+                else:
+                    log.warning(f"[CallHandler] ⚠️ Gemini stream still active after 2.0s, proceeding with available data")
+                
+                # Build merged requirements from multiple sources
+                merged_requirements = {
+                    "customer_name": "",
+                    "company_name": "",
+                    "location": "",
+                    "interested_products": "",
+                    "required_quantity": "",
+                    "business_requirement": "",
+                    "bulk_and_other_requirements": "",
+                    "mobile_number": ""
+                }
+                
+                # Source 1: CustomerRequirementService (Redis + in-memory, updated via save_field)
                 if req_service:
-                    requirements = await req_service.get_requirements(call_id)
-                    if requirements:
-                        log.info(f"[CallHandler] ✅ Requirements fetched for {call_id}")
+                    try:
+                        req_data = await req_service.get_requirements(call_id)
+                        if req_data:
+                            log.info(f"[CallHandler] ✅ Source 1 (ReqService): Found {len([v for v in req_data.values() if v])} fields")
+                            for key, value in req_data.items():
+                                if value and value != "N/A" and not (isinstance(value, str) and value.strip() == ""):
+                                    merged_requirements[key] = value
+                        else:
+                            log.info(f"[CallHandler] ⚠️ Source 1 (ReqService): No data")
+                    except Exception as e:
+                        log.error(f"[CallHandler] Error retrieving from ReqService: {e}")
+                
+                # Source 2: GeminiAudioSession.collected (local in-process cache)
+                if gemini_session and gemini_session.collected:
+                    try:
+                        log.info(f"[CallHandler] ✅ Source 2 (GeminiSession): Found {len(gemini_session.collected)} fields in memory")
+                        for key, value in gemini_session.collected.items():
+                            if value and value != "N/A" and not (isinstance(value, str) and value.strip() == ""):
+                                # Only overwrite if ReqService didn't have it
+                                if not merged_requirements[key]:
+                                    merged_requirements[key] = value
+                    except Exception as e:
+                        log.error(f"[CallHandler] Error retrieving from GeminiSession: {e}")
+                
+                # Count how many fields we actually have
+                captured_fields = sum(1 for v in merged_requirements.values() if v and v != "N/A" and v.strip() != "")
+                log.info(f"[CallHandler] 📊 Final merge result: {captured_fields}/8 fields captured")
+                
+                # Create final requirements dict (remove empty strings, keep N/A for missing fields)
+                requirements = {}
+                for key, value in merged_requirements.items():
+                    if value and value != "N/A" and value.strip() != "":
+                        requirements[key] = value
+                    else:
+                        requirements[key] = "N/A"  # Mark as N/A only if truly not captured
+                
+                log.info(f"[CallHandler] ✅ Requirements finalized: {requirements}")
 
                 # ========== GOOGLE SHEETS SAVE WITH IDEMPOTENCY ==========
                 # Check if requirements were already saved (idempotency protection)
@@ -216,19 +315,53 @@ class CallHandler:
                 log.info(f"[GOOGLE-SHEETS] Requirements: {requirements if requirements else 'None'}")
                 
                 if requirements and lead_service and not requirements_already_saved:
-                    log.info(f"[GOOGLE-SHEETS] Preparing customer requirement record")
+                    log.info(f"[GOOGLE-SHEETS] Preparing customer requirement record (may be partial capture)")
                     
-                    # Get call session ID and mobile number from session
+                    # ✅ CRITICAL FIX #2: Use mobile_number from session (set at call start from ARI)
+                    # First try to get mobile_number from requirements (if customer provided one during call)
+                    mobile_number = requirements.get("mobile_number", "").strip()
+                    
+                    # If not provided during call, use the ARI caller_number stored at call start
+                    if not mobile_number or mobile_number == "N/A":
+                        session_mobile = session.get("caller_number", "").strip()
+                        if session_mobile and session_mobile != "unknown":
+                            mobile_number = session_mobile
+                            log.info(f"[GOOGLE-SHEETS] Using mobile_number from call start (ARI): {mobile_number}")
+                        else:
+                            mobile_number = "N/A"
+                            log.warning(f"[GOOGLE-SHEETS] No mobile_number available, using N/A")
+                    else:
+                        log.info(f"[GOOGLE-SHEETS] Using mobile_number provided during call: {mobile_number}")
+                    
+                    # Get call session ID from session
                     call_session_id = session.get("call_session_id", call_id)
-                    mobile_number = caller_number if caller_number != "unknown" else "N/A"
                     
                     log.info(f"[GOOGLE-SHEETS] Call Session ID: {call_session_id}")
                     log.info(f"[GOOGLE-SHEETS] Call ID (from ARI): {call_id}")
                     log.info(f"[GOOGLE-SHEETS] Customer Mobile: {mobile_number}")
-                    log.info(f"[GOOGLE-SHEETS] Validated fields: 8/8")
+                    
+                    # Count captured fields (non-N/A values)
+                    captured_count = sum(1 for k in ["customer_name", "company_name", "location", 
+                                                      "interested_products", "required_quantity", 
+                                                      "business_requirement", "bulk_and_other_requirements"] 
+                                        if requirements.get(k, "N/A") != "N/A")
+                    log.info(f"[GOOGLE-SHEETS] Captured fields: {captured_count}/7 requirement fields")
                     log.info(f"[GOOGLE-SHEETS] Target worksheet: GID 0")
                     
                     # Prepare complete requirement payload with metadata
+                    # CRITICAL: Preserve captured values exactly as extracted, only use N/A for truly missing fields
+                    # 
+                    # Column Mapping to Google Sheets (10 columns):
+                    #   A: call_session_id
+                    #   B: mobile_number (ARI caller ID or customer-provided)
+                    #   C: customer_name
+                    #   D: company_name
+                    #   E: location
+                    #   F: interested_products (comma-separated if array)
+                    #   G: required_quantity
+                    #   H: business_requirement
+                    #   I: bulk_and_other_requirements
+                    #   J: call_timestamp (ISO format)
                     sheets_payload = {
                         "call_session_id": call_session_id,
                         "mobile_number": mobile_number,
@@ -244,13 +377,14 @@ class CallHandler:
                     
                     log.info(f"[GOOGLE-SHEETS] Payload: {sheets_payload}")
                     log.info(f"[GOOGLE-SHEETS] Header mapping validated")
-                    log.info(f"[GOOGLE-SHEETS] Appending customer record")
+                    log.info(f"[GOOGLE-SHEETS] Appending customer record (partial capture OK: {captured_count}/7)")
                     
                     # Save to Google Sheets
                     result = await lead_service.save_requirements(sheets_payload)
                     
                     if result and result.get("success"):
-                        log.info(f"[GOOGLE-SHEETS] Row appended successfully")
+                        log.info(f"[GOOGLE-SHEETS] ✅ Row appended successfully")
+                        log.info(f"[GOOGLE-SHEETS] 📊 Captured {captured_count}/7 fields + mobile")
                         log.info(f"[GOOGLE-SHEETS] Persistence completed for call: {call_session_id}")
                         
                         # Mark as saved ONLY after successful API response
@@ -266,13 +400,13 @@ class CallHandler:
                         # Continue with cleanup - don't block call end
                         
                 elif requirements_already_saved:
-                    log.info(f"[GOOGLE-SHEETS] Skipping: Requirements already saved (idempotency)")
+                    log.info(f"[GOOGLE-SHEETS] ⏭️ Skipping: Requirements already saved (idempotency)")
                     log.info(f"[GOOGLE-SHEETS] Call Session ID: {session.get('call_session_id', call_id)}")
                 else:
                     if not requirements:
-                        log.warning(f"[CallHandler] No requirements collected for {call_id}")
+                        log.warning(f"[CallHandler] ⚠️ No requirements collected for {call_id}")
                     if not lead_service:
-                        log.warning(f"[CallHandler] Lead storage service not available")
+                        log.warning(f"[CallHandler] ⚠️ Lead storage service not available")
 
                 # Get complete conversation transcript
                 full_conversation_text = await get_complete_transcript(call_id)
